@@ -81,4 +81,6 @@ ase gui outer_only.traj
 # or extract single .con and then..
 # --multiplicity 2 for doublet
 python -m rgpycrumbs.geom.fragments bond-order pos.con --visualize --mutliplicity 2
+# to get an overview
+uv run ../run_pf.py snake_runs/softest_mode_scg_barrier/ -q
 #+end_src
