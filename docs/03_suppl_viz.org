@@ -948,7 +948,7 @@ plot_success_comp <- function(df,
   plot_levels <- c(-2, -1, 0, 1)
   plot_labels <- c("Both :: F", paste(level_names[2], "only"), "Both :: P", paste(level_names[1], "only"))
   plot_colors <- setNames(point_colors, plot_levels)
-  yaxis_labels <- c("Both :: F", paste(level_names[2], ":: F"), "Both :: P", paste(level_names[1], " :: P"))
+  yaxis_labels <- c("Both :: F", paste(level_names[2], "Only"), "Both :: P", paste(level_names[1], "Only"))
 
   # --- Plotting ---
   p1 <- ggplot(mapping = aes(x = id)) +
