@@ -1,0 +1,157 @@
+* HPC management
+These will center around ~elja~.
+
+#+begin_src bash
+# Send stuff to elja
+rsync -alPxz $HOME/Git/Github/TheochemUI/gprdzbl/ \
+    elja:Git/Github/TheochemUI/gprdzbl \
+    --exclude=".pixi/*" --exclude="*/**/bbdir/*" \
+    --exclude=".git/*" --exclude="*.lock" \
+    --exclude=".snakemake/*" --exclude="gprd_local/*" \
+    --exclude="gprd_hpc/*" --exclude=".cache/*" \
+    --exclude="__pycache__/*" --exclude="fps_hist_5/*"
+# Bring stuff back, assuming that gprd_hpc was renamed to fps_hist_5
+rsync -alPxz elja:Git/Github/TheochemUI/gprdzbl/runs/automated/snake_runs/ \
+    $HOME/Git/Github/TheochemUI/gprdzbl/runs/automated/snake_runs \
+    --exclude=".pixi/*" --exclude="*/**/bbdir/*" \
+    --exclude=".git/*" --exclude="*.lock" \
+    --exclude=".snakemake/*" --exclude="gprd_hpc/*" \
+    --exclude="gprd_local/*"
+#+end_src
+
+For the first run, it is also important to set the ~SCM~ variable. Since the ~.git~ stuff is not synced, but is required for a few scripts, it is easier to initialize it.
+
+#+begin_src bash
+cd ~/Git/Github/TheochemUI/gprdzbl
+export SETUPTOOLS_SCM_PRETEND_VERSION="v0.0.dev0+gprd_zbl"
+git init
+pixi s -e eon
+#+end_src
+
+Remember to always grab an interactive node, since the login nodes are severely compute bound.
+
+#+begin_src bash
+srun -N 1 -n 32 -t 60 -p any_cpu --pty /bin/bash
+#+end_src
+
+However, it is easier to build ~nwchem~ from source:
+
+#+begin_src bash
+# GCCcore/14.2.0
+ml use /hpcapps/lib-edda/modules/all/Core
+ml load GCC/14.2.0
+# Of course elja is broken
+export NWCHEM_TOP=$(pwd)
+export NWCHEM_TARGET="LINUX64"
+export NWCHEM_MODULES="all"
+
+# MPI and ARMCI network configuration.
+export USE_MPI=1
+export USE_MPIF=1
+export USE_MPIF4=1
+export ARMCI_NETWORK="MPI-PR"
+
+# BLAS and ScaLAPACK configuration.
+export BUILD_OPENBLAS=1
+export BUILD_SCALAPACK=1
+export BLAS_SIZE=8
+export SCALAPACK_SIZE=8
+export USE_SCALAPACK=1
+
+cd "$NWCHEM_TOP"/src
+
+make nwchem_config -j32
+make -j32
+#+end_src
+
+with ~spack~, we'll need to add ~version('eongprdzbl', commit='4c48fa339ec671bd78c1ebeea0c1f64104646267')~:
+#+begin_src bash
+# outside the pixi environent
+ml use /hpcapps/lib-edda/modules/all/Core
+ml load GCC/14.2.0
+# spack repo update builtin --tag v2025.07.0
+# spack mirror add develop-2025-06-01 https://binaries.spack.io/develop-2025-06-01
+# spack buildcache keys --install --trust
+spack install intel-oneapi-compilers-classic
+spack compiler find $(spack location -i intel-oneapi-compilers-classic)
+spack install nwchem@eongprdzbl+elpa %intel-oneapi-compilers
+# ./scripts/build_nwchem.sh 4c48fa339ec671bd78c1ebeea0c1f64104646267
+#+end_src
+
+** Monitoring
+
+Once that finally works...
+#+begin_src bash
+pixi s -e eon
+export IS_HPC="true"
+export NWCHEM_COMMAND=$(which nwchem)
+export RUN_NAME="gprd_hpc"
+snakemake --workflow-profile ./profiles/elja_generic/
+#+end_src
+
+Monitored with:
+#+begin_src bash
+squeue --format="%.18i %.9P %.90j %.8u %.8T %.10M %.9l %.6D %R" --me
+squeue -u $USER -o "%.10i %.45j %.10T %.20V %.12M %.12L %.10P %R"
+#+end_src
+Or the more fancy project specific:
+#+begin_src bash
+squeue -u $USER -o "%.10i %j %.8T %.12M %.12L %R" | \
+awk '
+BEGIN {
+    # Print a custom header
+    printf "%-10s %-20s %-8s %-12s %-12s %s\n", "JOBID", "RUN_NAME", "STATE", "TIME_USED", "TIME_LEFT", "NODELIST(REASON)";
+}
+NR > 1 {
+    # NR > 1 skips the header line from squeue itself
+
+    # --- Transformation Logic ---
+    # Default values
+    rundir = "N/A";
+    spin_char = "?";
+    idx = "N/A";
+
+    # Split the job name (column 2) by commas or hyphens
+    n = split($2, parts, /[,-]/);
+
+    # Loop through the parts to find our keys
+    for (i=1; i<=n; i++) {
+        if (parts[i] ~ /^rundir=/) { sub("rundir=", "", parts[i]); rundir = parts[i]; }
+        if (parts[i] ~ /^spin=/)   { sub("spin=", "", parts[i]); spin_char = (parts[i] ~ /^s/ ? "S" : "D"); }
+        if (parts[i] ~ /^index=/)  { sub("index=", "", parts[i]); idx = parts[i]; }
+    }
+
+    # Combine into the new desired name format
+    new_name = sprintf("%s/%s%s", rundir, spin_char, idx);
+
+    # --- Print the Formatted Line ---
+    # $1=JobID, $3=State, $4=TimeUsed, $5=TimeLeft, $6...=The rest of the line
+    printf "%-10s %-20s %-8s %-12s %-12s", $1, new_name, $3, $4, $5;
+    for (i=6; i<=NF; i++) {
+        printf " %s", $i;
+    }
+    printf "\n";
+}'
+#+end_src
+
+Or as an ~alias~:
+#+begin_src bash
+alias sq='squeue -u $USER -o "%.10i %j %.8T %.12M %.12L %R" | awk '\''
+BEGIN {
+    printf "%-10s %-20s %-8s %-12s %-12s %s\n", "JOBID", "RUN_NAME", "STATE", "TIME_USED", "TIME_LEFT", "NODELIST(REASON)";
+}
+NR > 1 {
+    rundir = "N/A"; spin_char = "?"; idx = "N/A";
+    n = split($2, parts, /[,-]/);
+    for (i=1; i<=n; i++) {
+        if (parts[i] ~ /^rundir=/) { sub("rundir=", "", parts[i]); rundir = parts[i]; }
+        if (parts[i] ~ /^spin=/)   { sub("spin=", "", parts[i]); spin_char = (parts[i] ~ /^s/ ? "S" : "D"); }
+        if (parts[i] ~ /^index=/)  { sub("index=", "", parts[i]); idx = parts[i]; }
+    }
+    new_name = sprintf("%s/%s%s", rundir, spin_char, idx);
+    printf "%-10s %-20s %-8s %-12s %-12s", $1, new_name, $3, $4, $5;
+    for (i=6; i<=NF; i++) { printf " %s", $i; }
+    printf "\n";
+}'\'''
+#+end_src
+Which pairs nicely with a ~watchexec~:
