@@ -38,9 +38,7 @@ The repository has code archives, benchmark runs, and scripts for analysis.
 #+begin_src bash
 ❯ tree -L 2
 .
-├── config
-│   └── vocabularies
-├── data
+├── CODEOWNERS
 ├── docs
 │   ├── 00_freeform.org
 │   ├── 01_hpc.org
@@ -49,21 +47,23 @@ The repository has code archives, benchmark runs, and scripts for analysis.
 │   └── 05_suppl_py.org
 ├── LICENSE
 ├── pixi.lock
+├── pixi.toml
+├── readme.org
 ├── runs
 │   ├── automated
 │   ├── calc_rundata.py
 │   ├── init_condcheck.py
-│   ├── manual
-│   ├── readme.org
-│   └── rundata
+│   └── run_pf.py
 ├── scripts
 │   ├── build_nwchem.sh
 │   └── env_setup.sh
-├── subrepos
-│   ├── chemparseplot
-│   ├── IterativeRotationsAssignments
-│   └── rgpycrumbs
-└── vale.ini
+└── subrepos
+    ├── chemparseplot
+    ├── eOn
+    ├── gpr_optim
+    ├── IterativeRotationsAssignments
+    ├── readme.org
+    └── rgpycrumbs
 #+end_src
 
 Where the data in the archives expands to locations within the benchmarks.
