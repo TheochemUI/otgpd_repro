@@ -1,6 +1,9 @@
 * About
 Contains the reproduction details for the publication on the wall-time efficient and robust optimal transport Gaussian Process dimer.
 
+Third in a series of papers [1, 2] on the Dimer method with a focus on the failure
+modes of the Gaussian Process Regression model on the 500 system benchmark of
+Hermes et. al. [3].
 ** Reference
 If you use this repository or its parts please cite the corresponding publication or data source.
 *** Primary Publication
@@ -31,7 +34,7 @@ cd $GITROOT/bench_runs/runs/hpc
 tar -xf hpc.tar.xz && rm -rf hpc.tar.xz
 #+end_src
 *** Structure
-The repo has code archives, benchmark runs, and scripts for analysis.
+The repository has code archives, benchmark runs, and scripts for analysis.
 #+begin_src bash
 ❯ tree -L 2
 .
@@ -88,12 +91,26 @@ For comparisons:
 - Dimer (rotation separated) runs :: From [[https://archive.materialscloud.org/record/2025.91][this archive]]
 * Usage
 A reproducible setup for generating benchmarks discussed elsewhere [1 ([[https://github.com/TheochemUI/gpr_sella_repro][Github]]), 2 ([[https://github.com/HaoZeke/brms_idrot_repro/blob/main/readme.org][Github]])].
-
 ** Setup
-~docs/~ contains documentation.
-
+- ~docs/~ contains documentation.
+- ~pixi~ tasks encapsulate ~dev~ tasks.
+** Design
+*** Sub-repositories
+Each of the main tools are mirrored with ~git-subrepo~ to ensure
+reproducibility.
+*** DVC
+The raw data stores are located on the University of Iceland OneDrive instance
+and handled via a WebDAV interface to the store.
+#+begin_src bash
+rclone serve webdav HIOneDrive:/.dvcstore --vfs-cache-mode full --addr localhost:9677
+#+end_src
 ** References
-1. R. Goswami, M. Masterov, S. Kamath, A. Pena-Torres, and H. Jónsson, “Efficient Implementation of Gaussian Process Regression Accelerated Saddle Point Searches with Application to Molecular Reactions,” J. Chem. Theory Comput., July 2025, doi: 10.1021/acs.jctc.5c00866.
-2. R. Goswami, “Bayesian hierarchical models for quantitative estimates for performance metrics applied to saddle search algorithms,” AIP Adv., vol. 15, no. 8, p. 85210, Aug. 2025, doi: 10.1063/5.0283639.
+#+begin_quote
+[1] R. Goswami, M. Masterov, S. Kamath, A. Pena-Torres, and H. Jónsson, “Efficient Implementation of Gaussian Process Regression Accelerated Saddle Point Searches with Application to Molecular Reactions,” J. Chem. Theory Comput., Jul. 2025, doi: 10.1021/acs.jctc.5c00866.
+
+[2] R. Goswami, “Bayesian hierarchical models for quantitative estimates for performance metrics applied to saddle search algorithms,” AIP Adv., vol. 15, no. 8, p. 85210, Aug. 2025, doi: 10.1063/5.0283639.
+
+[3] E. D. Hermes, K. Sargsyan, H. N. Najm, and J. Zádor, “Sella, an Open-Source Automation-Friendly Molecular Saddle Point Optimizer,” J. Chem. Theory Comput., vol. 18, no. 11, pp. 6974–6988, Nov. 2022, doi: 10.1021/acs.jctc.2c00395.
+#+end_quote
 * License
 MIT. Sub-packages have their own licenses.
