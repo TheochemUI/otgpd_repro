@@ -1,0 +1,75 @@
+* ~dvc~ setup
+Amazingly it is necessary to serve with the ~openssl~ setting even though
+verification is disabled later.
+#+begin_src bash
+openssl ecparam -out ec_key.pem -name prime256v1 -genkey
+openssl req -new -key ec_key.pem -x509 -nodes -days 365 -out cert.pem
+# Always good to see logs with -vv
+rclone serve webdav HIOneDrive:/.dvcstore --vfs-cache-mode full --addr localhost:9677 --cert cert.pem --key ec_key.pem -vv
+#+end_src
+Now we can set things up.
+#+begin_src bash
+dvc init
+dvc remote add -d HIOneDrive webdavs:localhost:9677
+dvc remote modify hionedrive ssl_verify false
+#+end_src
+* Sub-repositories
+The idea is to setup a branch before cloning everything in with ~git sub-repo~.
+Often a ~rebase~ to keep clean commit messages is a good idea.
+* Installation log
+** EON
+#+begin_src bash
+pixi r mkeon release
+#+end_src
+** NWChem
+Essentially:
+#+begin_src bash
+export NWCHEM_TOP=$(pwd)
+export NWCHEM_TARGET="LINUX64"
+export NWCHEM_MODULES="all"
+
+# MPI and ARMCI network configuration.
+export USE_MPI=1
+export USE_MPIF=1
+export USE_MPIF4=1
+export ARMCI_NETWORK="MPI-PR"
+
+# BLAS and ScaLAPACK configuration.
+export BUILD_OPENBLAS=1
+export BUILD_SCALAPACK=1
+export BLAS_SIZE=8
+export SCALAPACK_SIZE=8
+export USE_SCALAPACK=1
+
+cd "$NWCHEM_TOP"/src
+
+make nwchem_config
+bless -- make -j8
+#+end_src
+
+Now also:
+#+begin_src bash
+pixi r mknwchem
+#+end_src
+
+* Final run configuration
+After much soul-searching, I opted to use the improved dimer direction and displacement:
+#+begin_src bash
+export EON_DISPLACEMENT_DIR="/home/rgoswami/Git/Github/TheochemUI/gprd_sella_bench/bench_runs/eon/runs/1e8m/idimer/final_lbfgsrot_lbfgs"
+export IS_HPC="false"
+export NWCHEM_COMMAND=$(which nwchem)
+export RUN_NAME="final_gprd_ceres"
+export NWCHEM_MPI=10
+snakemake -k -c1 --scheduler greedy  --keep-incomplete
+#+end_src
+To generate the initial files, then send it to the HPC and run.
+
+Or rather on the HPC:
+#+begin_src bash
+export IS_HPC="true"
+export NWCHEM_COMMAND=$(which nwchem)
+export RUN_NAME="final_gprd_ceres"
+export NWCHEM_MPI=16
+export EON_DISPLACEMENT_DIR="/users/home/rog32/Git/Github/TheochemUI/gprd_sella_bench/bench_runs/eon/runs/1e8m/idimer/final_cgrot_lbfgs_dimer"
+snakemake --workflow-profile ./profiles/elja_generic
+#+end_src

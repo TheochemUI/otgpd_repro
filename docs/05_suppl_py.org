@@ -1,0 +1,411 @@
+# -*- org-src-preserve-indentation: t; org-edit-src-content: 0; -*-
+#+TITLE: Supplementary V: Python Snippets
+#+AUTHOR: Rohit Goswami
+#+EMAIL: rog32@hi.is
+# This should not be altered
+#+OPTIONS: toc:nil title:nil todo:nil
+# I need the footnotes to be inlined
+#+STARTUP: fninline
+
+* Configuration :ignoreheading:ignore:noexport:
+  :PROPERTIES:
+  :VISIBILITY: folded
+  :END:
+#+BEGIN_SRC emacs-lisp :exports none :eval always :results none
+(require 'ox-extra)
+(ox-extras-activate '(ignore-headlines))
+;; Optional, should probably be in the user config
+(setq 'org-hide-emphasis-markers t)
+#+END_SRC
+** Theme :ignoreheading:ignore:
+#+HTML_HEAD: <link rel="stylesheet" type="text/css" href="https://gongzhitaao.org/orgcss/org.css"/>
+#+BEGIN_SRC emacs-lisp :exports none :results none :eval always
+(setq org-html-head-include-default-style nil)
+(setq org-html-htmlize-output-type 'css)
+#+END_SRC
+* Start Here :ignoreheading:ignore:
+* Baseline variables
+We need some directories to ground the analysis.
+#+begin_src bash :session shared :results value none :async yes
+export PIXI_NO_PROGRESS=true
+#+end_src
+* Python wrangling
+:PROPERTIES:
+:header-args:python: :python "pixi run -e eon python" :session onePy :results value :exports both :cache yes :tangle 05_snips.py
+:END:
+
+#+begin_src python :results discard
+import numpy as np
+from ase import Atoms
+from scipy.optimize import linear_sum_assignment
+from collections import defaultdict
+#+end_src
+
+#+RESULTS:
+
+** Distances
+
+#+begin_src python :results discard
+def dist_max1dlog(atoms1: Atoms, atoms2: Atoms) -> float:
+    """Calculates the non-invariant 1D max log distance."""
+    if len(atoms1) != len(atoms2):
+        raise ValueError("Atom counts must be identical.")
+
+    n_atoms = len(atoms1)
+    max_log_ratio = 0.0
+
+    for i in range(n_atoms):
+        for j in range(i + 1, n_atoms):
+            r_ij_1 = atoms1.get_distance(i, j, mic=False)
+            r_ij_2 = atoms2.get_distance(i, j, mic=False)
+            if r_ij_1 == 0.0 or r_ij_2 == 0.0:
+                continue
+            abs_log_ratio = np.abs(np.log(r_ij_2 / r_ij_1))
+            if abs_log_ratio > max_log_ratio:
+                max_log_ratio = abs_log_ratio
+
+    return max_log_ratio
+#+end_src
+
+#+RESULTS:
+
+#+begin_src python :results discard
+def dist_emd(atoms1: Atoms, atoms2: Atoms) -> float:
+    """Calculates the permutationally-invariant intensive EMD."""
+    if (
+        len(atoms1) != len(atoms2)
+        or atoms1.get_chemical_symbols() != atoms2.get_chemical_symbols()
+    ):
+        raise ValueError("Configurations must have identical atom counts and types.")
+
+    symbols = atoms1.get_chemical_symbols()
+    pos1 = atoms1.get_positions()
+    pos2 = atoms2.get_positions()
+
+    indices_by_type = defaultdict(list)
+    for i, sym in enumerate(symbols):
+        indices_by_type[sym].append(i)
+
+    max_of_avg_type_emds = 0.0
+
+    for symbol, indices in indices_by_type.items():
+        if not indices:
+            continue
+
+        num_type_atoms = len(indices)
+
+        cost_matrix = np.zeros((num_type_atoms, num_type_atoms))
+        for i_idx, i in enumerate(indices):
+            for j_idx, j in enumerate(indices):
+                cost_matrix[i_idx, j_idx] = np.linalg.norm(pos1[i] - pos2[j])
+
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        total_emd_for_type = cost_matrix[row_ind, col_ind].sum()
+        avg_emd_for_type = total_emd_for_type / num_type_atoms
+
+        if avg_emd_for_type > max_of_avg_type_emds:
+            max_of_avg_type_emds = avg_emd_for_type
+
+    return max_of_avg_type_emds
+#+end_src
+
+#+RESULTS:
+
+** Water stretch tests
+#+begin_src python :results output
+bond_angle_rad = 104.5 * np.pi / 180.0
+pos_x1 = [
+    [0.0, 0.0, 0.0],
+    [0.9, 0.0, 0.0],
+    [1.1 * np.cos(bond_angle_rad), 1.1 * np.sin(bond_angle_rad), 0.0],
+]
+x1 = Atoms("OH2", positions=pos_x1)
+print("\nConfiguration x1 (Reference):")
+print(x1.get_positions())
+print(
+    f"Distances: r(0,1)={x1.get_distance(0, 1):.4f}, r(0,2)={x1.get_distance(0, 2):.4f}"
+)
+#+end_src
+
+#+RESULTS[8c752db27adccc4920b0b2e0d393b6c35d9bd44b]:
+:
+: Configuration x1 (Reference):
+: [[ 0.         0.         0.       ]
+:  [ 0.9        0.         0.       ]
+:  [-0.275418   1.0649624  0.       ]]
+: Distances: r(0,1)=0.9000, r(0,2)=1.1000
+
+#+begin_src python :results output
+pos_x2 = [
+    [0.0, 0.0, 0.0],
+    [0.95, 0.0, 0.0],
+    [1.05 * np.cos(bond_angle_rad), 1.05 * np.sin(bond_angle_rad), 0.0],
+]
+x2 = Atoms("OH2", positions=pos_x2)
+print("\nConfiguration x2 (Perturbed):")
+print(x2.get_positions())
+print(
+    f"Distances: r(0,1)={x2.get_distance(0, 1):.4f}, r(0,2)={x2.get_distance(0, 2):.4f}"
+)
+#+end_src
+
+#+RESULTS[7cd6fcbcaf84673ce3e062c5e0bfffc9c8a477e1]:
+:
+: Configuration x2 (Perturbed):
+: [[ 0.          0.          0.        ]
+:  [ 0.95        0.          0.        ]
+:  [-0.262899    1.01655502  0.        ]]
+: Distances: r(0,1)=0.9500, r(0,2)=1.0500
+
+#+begin_src python :results output
+pos_x2_swapped = [x2.positions[0], x2.positions[2], x2.positions[1]]
+x2_swapped = Atoms("OH2", positions=pos_x2_swapped)
+print("\nConfiguration x2_swapped (Labels of H atoms swapped):")
+print(x2_swapped.get_positions())
+print(
+    f"Distances: r(0,1)={x2_swapped.get_distance(0, 1):.4f}, r(0,2)={x2_swapped.get_distance(0, 2):.4f}"
+)
+#+end_src
+
+#+RESULTS[35bdbb2d6369e1a05643d6e3bf478bff8f9d5a71]:
+:
+: Configuration x2_swapped (Labels of H atoms swapped):
+: [[ 0.          0.          0.        ]
+:  [-0.262899    1.01655502  0.        ]
+:  [ 0.95        0.          0.        ]]
+: Distances: r(0,1)=1.0500, r(0,2)=0.9500
+
+#+begin_src python :results output
+# Calculate all required distances
+dist_1_2_log = dist_max1dlog(x1, x2)
+dist_1_2swapped_log = dist_max1dlog(x1, x2_swapped)
+dist_2_2swapped_log = dist_max1dlog(x2, x2_swapped)
+
+dist_1_2_emd = dist_emd(x1, x2)
+dist_1_2swapped_emd = dist_emd(x1, x2_swapped)
+dist_2_2swapped_emd = dist_emd(x2, x2_swapped)
+
+# Print formatted results
+print("\n1. 1D Max Log Distance (Non-Invariant)")
+print(f"   Distance D(x1, x2)         = {dist_1_2_log:.8f}")
+print(f"   Distance D(x1, x2_swapped) = {dist_1_2swapped_log:.8f}")
+
+print("\n2. Earth Mover's Distance (Invariant)")
+print(f"   Distance D(x1, x2)         = {dist_1_2_emd:.8f}")
+print(f"   Distance D(x1, x2_swapped) = {dist_1_2swapped_emd:.8f}")
+
+print("\n\n--- Conclusion ---")
+print(
+    "The results show that D(x1, x2) and D(x1, x2_swapped) produce different values"
+)
+print("for the 1D Max Log metric, proving it is **not permutationally invariant**.")
+print("\nIn contrast, the EMD metric gives identical values, proving it correctly")
+print("handles permutations and recognizes physical symmetry.")
+
+print(
+    "\nBonus Check: Distance between two geometrically identical configurations (x2 vs x2_swapped)"
+)
+print(f"   1D Max Log : {dist_2_2swapped_log:.8f} (Incorrectly non-zero)")
+print(f"   EMD        : {dist_2_2swapped_emd:.8f} (Correctly zero)")
+#+end_src
+
+#+RESULTS[ea693f3e0ca8c4437ba49f59c89405704f7db858]:
+#+begin_example
+
+1. 1D Max Log Distance (Non-Invariant)
+   Distance D(x1, x2)         = 0.05406722
+   Distance D(x1, x2_swapped) = 0.15415068
+
+2. Earth Mover's Distance (Invariant)
+   Distance D(x1, x2)         = 0.05000000
+   Distance D(x1, x2_swapped) = 0.05000000
+
+
+--- Conclusion ---
+The results show that D(x1, x2) and D(x1, x2_swapped) produce different values
+for the 1D Max Log metric, proving it is **not permutationally invariant**.
+
+In contrast, the EMD metric gives identical values, proving it correctly
+handles permutations and recognizes physical symmetry.
+
+Bonus Check: Distance between two geometrically identical configurations (x2 vs x2_swapped)
+   1D Max Log : 0.10008346 (Incorrectly non-zero)
+   EMD        : 0.00000000 (Correctly zero)
+#+end_example
+
+*** Plots
+Preferably using more legible fonts..
+#+begin_src python :results discard
+plt.rcParams.update({
+        'font.sans-serif': 'Atkinson Hyperlegible',
+        'font.family': 'sans-serif',
+        # Set font for math text (like subscripts) if needed
+        'mathtext.fontset': 'custom',
+        'mathtext.rm': 'Atkinson Hyperlegible',
+        'mathtext.it': 'Atkinson Hyperlegible:italic',
+        'mathtext.bf': 'Atkinson Hyperlegible:bold',
+    })
+#+end_src
+
+#+RESULTS:
+
+We need a single plotter first.
+#+begin_src python :results discard
+def plot_single_molecule(ax, atoms_obj, title, x_offset=0, y_offset=0):
+    colors = {"O": "red", "H": "gray"}
+    radii = {"O": 0.25, "H": 0.15}
+
+    # Manually plot atoms to ensure consistent labeling (O0, H1, H2)
+    # Adjust positions by offset for placement in the larger figure
+    for i, atom in enumerate(atoms_obj):
+        ax.add_patch(
+            plt.Circle(
+                [atom.position[0] + x_offset, atom.position[1] + y_offset],
+                radius=radii[atom.symbol],
+                color=colors[atom.symbol],
+                zorder=2,
+            )
+        )
+        ax.text(
+            atom.position[0] + x_offset + 0.1,
+            atom.position[1] + y_offset + 0.1,
+            f"{atom.symbol}{i}",
+            fontsize=11,
+            ha="left",
+            va="bottom",
+            color="black",
+            weight="bold",
+        )
+
+    # Draw bonds and label distances
+    # O (atom 0) to H (atom 1)
+    r_01 = atoms_obj.get_distance(0, 1)
+    ax.plot(
+        [atoms_obj[0].position[0] + x_offset, atoms_obj[1].position[0] + x_offset],
+        [atoms_obj[0].position[1] + y_offset, atoms_obj[1].position[1] + y_offset],
+        "k-",
+        lw=1.5,
+        zorder=1,
+    )
+    mid_01 = (atoms_obj[0].position + atoms_obj[1].position) / 2
+    ax.text(
+        mid_01[0] + x_offset,
+        mid_01[1] + y_offset + 0.2,
+        f"{r_01:.3f} Å",
+        fontsize=8,
+        ha="center",
+        va="bottom",
+        bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
+    )
+
+    # O (atom 0) to H (atom 2)
+    r_02 = atoms_obj.get_distance(0, 2)
+    ax.plot(
+        [atoms_obj[0].position[0] + x_offset, atoms_obj[2].position[0] + x_offset],
+        [atoms_obj[0].position[1] + y_offset, atoms_obj[2].position[1] + y_offset],
+        "k-",
+        lw=1.5,
+        zorder=1,
+    )
+    mid_02 = (atoms_obj[0].position + atoms_obj[2].position) / 2
+    ax.text(
+        mid_02[0] + x_offset,
+        mid_02[1] + y_offset + 0.2,
+        f"{r_02:.3f} Å",
+        fontsize=10,
+        ha="center",
+        va="bottom",
+        bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
+    )
+
+    ax.text(
+        x_offset,
+        y_offset - 1.0,
+        title,
+        fontsize=12,
+        ha="center",
+        va="top",
+        weight="bold",
+    )
+#+end_src
+
+#+RESULTS:
+
+Which can then lead to.
+
+#+begin_src python :results output file :exports both
+fig, ax = plt.subplots(figsize=(18, 9))
+
+# Plot each molecule at specific x-offsets
+plot_single_molecule(ax, x1, "Config x1 (Reference)", x_offset=0)
+plot_single_molecule(ax, x2, "Config x2 (Perturbed)", x_offset=4)
+plot_single_molecule(
+    ax, x2_swapped, "Config x2_swapped (H Labels Permuted)", x_offset=8
+)
+
+# Add annotations for distances between molecule pairs
+# Connecting x1 to x2
+ax.annotate(
+    "",
+    xy=(1.5, 0.5),
+    xytext=(2.5, 0.5),
+    arrowprops=dict(arrowstyle="<->", color="blue", lw=2),
+)
+ax.text(
+    2.0,
+    0.8,
+    f"D(x1, x2)\nLog: {dist_1_2_log:.4f}\nEMD: {dist_1_2_emd:.4f}",
+    fontsize=12,
+    ha="center",
+    va="bottom",
+    color="blue",
+    bbox=dict(facecolor="white", alpha=0.8, edgecolor="none"),
+)
+
+# Connecting x1 to x2_swapped
+ax.annotate(
+    "",
+    xy=(1.5, -0.9),
+    xytext=(6.5, -0.9),
+    arrowprops=dict(arrowstyle="<->", color="purple", lw=2),
+)
+ax.text(
+    4.0,
+    -1.2,
+    f"D(x1, x2_swapped)\nLog: {dist_1_2swapped_log:.4f}\nEMD: {dist_1_2swapped_emd:.4f}",
+    fontsize=12,
+    ha="center",
+    va="top",
+    color="purple",
+    bbox=dict(facecolor="white", alpha=0.8, edgecolor="none"),
+)
+
+# Connecting x2 to x2_swapped (above, to show EMD is 0)
+dist_2_2swapped_log = dist_max1dlog(x2, x2_swapped)
+dist_2_2swapped_emd = dist_emd(x2, x2_swapped)
+ax.annotate(
+    "",
+    xy=(5.5, 1.5),
+    xytext=(6.5, 1.5),
+    arrowprops=dict(arrowstyle="<->", color="green", lw=2),
+)
+ax.text(
+    6.0,
+    1.8,
+    f"D(x2, x2_swapped)\nLog: {dist_2_2swapped_log:.4f}\nEMD: {dist_2_2swapped_emd:.4f}",
+    fontsize=12,
+    ha="center",
+    va="bottom",
+    color="green",
+    bbox=dict(facecolor="white", alpha=0.8, edgecolor="none"),
+)
+
+
+ax.set_aspect("equal", adjustable="box")
+ax.set_xlim(-1.5, 9.5)
+ax.set_ylim(-2.0, 2.5)
+ax.axis("off")
+plt.savefig("molecular_distance_comparison_fixed.png", bbox_inches="tight", dpi=200)
+plt.close(fig)
+print("molecular_distance_comparison_fixed.png")
+#+end_src

@@ -1,0 +1,3102 @@
+# -*- org-src-preserve-indentation: t; org-edit-src-content: 0; -*-
+#+TITLE: Supplementary I: Result Visualization
+#+AUTHOR: Rohit Goswami
+#+EMAIL: rog32@hi.is
+# This should not be altered
+#+OPTIONS: toc:nil title:nil todo:nil
+# I need the footnotes to be inlined
+#+STARTUP: fninline
+
+* Configuration :ignoreheading:ignore:noexport:
+  :PROPERTIES:
+  :VISIBILITY: folded
+  :END:
+#+BEGIN_SRC emacs-lisp :exports none :eval always :results none
+(require 'ox-extra)
+(ox-extras-activate '(ignore-headlines))
+;; Optional, should probably be in the user config
+(setq 'org-hide-emphasis-markers t)
+#+END_SRC
+** Theme :ignoreheading:ignore:
+#+HTML_HEAD: <link rel="stylesheet" type="text/css" href="https://gongzhitaao.org/orgcss/org.css"/>
+#+BEGIN_SRC emacs-lisp :exports none :results none :eval always
+(setq org-html-head-include-default-style nil)
+(setq org-html-htmlize-output-type 'css)
+#+END_SRC
+** Code Properties :ignoreheading:ignore:
+# Set headers everywhere
+# #+PROPERTY: header-args:R :session oneR :results output :exports both :cache yes :tangle rcode.R
+There's no need to expand the ~noweb~ bits while exporting, but it can be useful to debug:
+#+property: header-args :noweb no-export
+*** Formatting R dataframes
+#+NAME: round-tbl
+#+BEGIN_SRC emacs-lisp :var tbl="" :var fmt="%.1f"
+;; Kanged from https://brettpresnell.com/post/orgmode/
+  (mapcar (lambda (row)
+	    (mapcar (lambda (cell)
+		      (if (floatp cell)
+			  (format fmt cell)
+			cell))
+		    row))
+	  tbl)
+#+end_src
+
+#+RESULTS: round-tbl
+
+* Start Here :ignoreheading:ignore:
+* Baseline variables
+We need some directories to ground the analysis.
+#+begin_src bash :session shared :results value none :async yes
+export PIXI_NO_PROGRESS=true
+#+end_src
+
+* R wrangling
+:PROPERTIES:
+:header-args:R: :session oneR :results value :exports both :cache yes :tangle 00_sviz_rcode.R
+:END:
+
+We set the results to ~value~ so as to get the ~print()~ output instead of the mangled output.
+
+#+begin_src emacs-lisp :results none
+(let ((git-root-path (replace-regexp-in-string "\n" "" (shell-command-to-string "git rev-parse --show-toplevel"))))
+  ;; This variable is for the interactive ESS process, which is what you want for :session
+  (setq inferior-R-program
+        (concat git-root-path "/.pixi/envs/analysis/bin/R")))
+#+end_src
+
+#+begin_src R :results none
+## install.packages("khroma")
+library('httpgd')
+library('khroma')
+library('scales')
+library('patchwork')
+library('tidyverse')
+library('ragg')
+library('ggnewscale')
+library('ggthemes')
+library('ggridges')
+library('ggimage')
+library('latex2exp')
+# Sometimes needs to be killed with lsof -i tcp:$PORT and kill -9 $PID
+## hgd(port=9890)
+#+end_src
+
+Now we can start loading and using the data, with some basic wrangling, since
+the output format is homogenous for all the parsed runs, we will use a function.
+
+It is crucial to note that we *do not need to* facet by *spin* because
+effectively spin forms part of a system identifier, and is otherwise not a
+reasonable variable, as the form of calculation (UHF, RHF) doesn't change the
+fact that for each molecule only one form of the calculation is valid and each
+PES is different.
+
+#+begin_src R :results none
+gen_data <- function(fname) {
+  res <- read_csv(fname)
+  res %>% mutate(
+        ## TODO(rg): Total time needs to be explicitly mentioned in s
+        method = as.factor(
+          case_when(
+            method == "GPRD" ~ "GPDimer",
+            method == "OTGP" ~ "OTGPD",
+            method == "IDimer" ~ "Dimer",
+            .default = as.character(method)
+          )
+        ),
+        dimer_rot = as.factor(dimer_rot),
+        dimer_trans = as.factor(dimer_trans),
+        mol_id = as.factor(mol_id),
+        spin = as.factor(spin),
+        termination_status = as.factor(termination_status),
+        tot_time = tot_time / 60, ## Seconds to minutes
+        system_id = as.factor(
+          paste(str_sub(spin, 0, 1),
+                mol_id, sep='_')
+        ),
+        ) %>%
+        dplyr::relocate(
+          system_id, pes_calls,
+          tot_time,
+          everything()
+        ) -> res
+  return(res)
+}
+#+end_src
+
+#+begin_src R :results discard
+data_idimer = gen_data('runs/rundata/jctc/data_idimer_cgrot_lbfgs.csv')
+data_gprd = gen_data('runs/rundata/jctc/data_gprd.csv')
+data_otgp = gen_data('runs/rundata/data_otgp.csv')
+data_otgp_sfrag = gen_data('runs/rundata/data_otgp_wbo1ang.csv')
+dfff <- bind_rows(data_idimer, data_gprd, data_otgp)
+#+end_src
+
+#+RESULTS:
+
+*** Fragment details
+
+We classify fragments as those that have a Wiberg-Mayer bond order of greater than 0.7 and have geometric centers within one Angstrom of the fragments.
+
+#+begin_src R :results none
+read_fragments <- function(fname, spin) {
+  df <- read_csv(fname,
+    col_types = cols(
+      filename = col_character(),
+      num_fragments = col_integer(),
+      fragment_sizes = col_character()
+    )
+  ) %>%
+    mutate(
+      base_number = str_remove(filename, pattern = "\\.xyz$"),
+      system_id = as.factor(paste0(spin, "_", base_number)),
+      fragment_sizes_list = str_split(fragment_sizes, pattern = ","),
+      fragment_sizes = purrr::map(fragment_sizes_list, as.numeric)
+    ) %>%
+    select(system_id, num_fragments, fragment_sizes)
+  return(df)
+}
+#+end_src
+
+#+begin_src R :results none
+fragments <- bind_rows(
+  read_fragments("runs/automated/singlet_wbo_1ang.csv", "s"),
+  read_fragments("runs/automated/doublet_wbo_1ang.csv", "d")
+)
+dfff <- dfff %>% left_join(fragments)
+#+end_src
+
+** Auxiliary Functions
+To find the missing values.
+
+#+begin_src R :results none
+find_missing_in_x <- function(df, x_col, x_method) {
+  # 1. Filter data for all data and X methods
+  all_ids <- df %>%
+    select(mol_id, spin, system_id) %>%
+    distinct()
+
+  x_data <- df %>%
+    filter(success == TRUE) %>%
+    filter(.data[[x_col]] == x_method) %>%
+    select(mol_id, spin, system_id) %>%
+    distinct()
+
+  # 2. Find combinations missing in X
+  missing_in_x <- anti_join(all_ids, x_data, by = c("mol_id", "spin", "system_id"))
+
+  return(missing_in_x)
+}
+#+end_src
+
+Also for filtering to the same saddles.
+
+#+begin_src R :results none
+find_matching_saddles <- function(df, comparison_col, level1, level2, tolerance = 0.01, diff_in = "barrier") {
+  # Args:
+  #   df: Input data frame.
+  #   comparison_col: Column for comparison (e.g., "method", "dimer_rot").
+  #   level1: First level within comparison_col (e.g., "GPR-Dimer", "cg").
+  #   level2: Second level within comparison_col (e.g., "Sella", "lbfgs").
+  #   tolerance: Maximum allowed difference in barrier heights.
+  # Returns: Filtered data frame.
+
+  # Input validation
+  if (!all(c("success", comparison_col, "mol_id", "spin", "barrier") %in% colnames(df))) {
+    stop("Input DataFrame must have columns 'success', '", comparison_col, "', 'mol_id', 'spin', and 'barrier'.")
+  }
+  if (!is.numeric(tolerance) || tolerance < 0) {
+    stop("`tolerance` must be a non-negative number.")
+  }
+  if (!is.character(level1) || length(level1) != 1 ||
+      !is.character(level2) || length(level2) != 1) {
+    stop("`level1` and `level2` must be single character strings.")
+  }
+  if (level1 == level2){
+        stop("level1 and level2 must be distinct")
+  }
+      # Check if comparison levels exist
+    if (!all(c(level1, level2) %in% unique(df[[comparison_col]]))) {
+      missing_levels <- setdiff(c(level1, level2), unique(df[[comparison_col]]))
+      stop("Comparison levels not found in the data: ", paste(missing_levels, collapse=", "))
+    }
+
+
+  # Dynamically create column names
+  level1_barrier_col <- paste0(level1, "_barrier")
+  level2_barrier_col <- paste0(level2, "_barrier")
+
+  # --- EXACT Replication of Original Logic ---
+  result_df <- df %>%
+    filter(success == TRUE) %>%
+    group_by(mol_id, spin) %>%
+    mutate(
+      !!level1_barrier_col := ifelse(any(.data[[comparison_col]] == level1),
+                                     .data[[diff_in]][.data[[comparison_col]] == level1],
+                                     NA_real_),
+      !!level2_barrier_col := ifelse(any(.data[[comparison_col]] == level2),
+                                     .data[[diff_in]][.data[[comparison_col]] == level2],
+                                     NA_real_)
+    ) %>%
+      filter(abs(abs(.data[[level1_barrier_col]]) - abs(.data[[level2_barrier_col]])) <= tolerance) %>% #compare the diffs
+    ungroup() %>%
+    filter(.data[[comparison_col]] %in% c(level1, level2)) %>% # Keep only requested
+    select(-all_of(c(level1_barrier_col, level2_barrier_col))) # Remove created columns.
+
+  return(result_df)
+}
+#+end_src
+
+Moving beyond pairs.
+
+#+begin_src R :results none
+find_matching_saddles_all <- function(df, comparison_col, levels, tolerance = 0.01) {
+  # Args:
+  #   df: Input data frame.
+  #   comparison_col: Column for comparison (e.g., "method", "dimer_rot").
+  #   levels: A character vector of all levels to compare.
+  #   tolerance: Maximum allowed difference in barrier heights.
+  # Returns: Filtered data frame.
+
+  # Input validation
+  if (!all(c("success", comparison_col, "mol_id", "spin", "barrier") %in% colnames(df))) {
+    stop("Input DataFrame must have columns 'success', '", comparison_col, "', 'mol_id', 'spin', and 'barrier'.")
+  }
+  if (!is.numeric(tolerance) || tolerance < 0) {
+    stop("`tolerance` must be a non-negative number.")
+  }
+  if (!is.character(levels) || length(levels) < 2) {
+    stop("`levels` must be a character vector with at least two elements.")
+  }
+  if (any(duplicated(levels))){
+    stop("`levels` must contain unique values")
+  }
+
+  # Check if comparison levels exist
+  if (!all(levels %in% unique(df[[comparison_col]]))) {
+    missing_levels <- setdiff(levels, unique(df[[comparison_col]]))
+    stop("Comparison levels not found in the data: ", paste(missing_levels, collapse=", "))
+  }
+
+  n_levels <- length(levels)
+  barrier_cols <- paste0(levels, "_barrier")
+
+  result_df <- df %>%
+    filter(success == TRUE) %>%
+    group_by(mol_id, spin)
+
+    #Dynamically create barrier columns
+    for (i in seq_along(levels)){
+        level <- levels[i]
+        barrier_col <- barrier_cols[i]
+        result_df <- result_df %>%
+            mutate(!!barrier_col := ifelse(any(.data[[comparison_col]] == level),
+                                           barrier[.data[[comparison_col]] == level],
+                                           NA_real_))
+    }
+
+  result_df <- result_df %>%
+    filter(if_all(all_of(barrier_cols), ~!is.na(.))) #Check if all barriers are present
+
+  #Compare all barrier heights
+  for (i in 1:(n_levels - 1)) {
+    for (j in (i + 1):n_levels) {
+      level1_barrier_col <- barrier_cols[i]
+      level2_barrier_col <- barrier_cols[j]
+      result_df <- result_df %>%
+        filter(abs(abs(.data[[level1_barrier_col]]) - abs(.data[[level2_barrier_col]])) <= tolerance)
+    }
+  }
+
+  result_df <- result_df %>%
+    ungroup() %>%
+    filter(.data[[comparison_col]] %in% levels) %>%
+    select(-all_of(barrier_cols)) # Remove created columns.
+
+  return(result_df)
+}
+#+end_src
+
+This now sets the stage for some plotting functions.
+
+#+begin_src R :results none
+gen_diff_data <- function(df, diff_in, comparison_col, level1, level2, tolerance = 0.01, sort_by = "init_energy") {
+  find_matching_saddles(df, comparison_col, level2, level1, tolerance) -> same_saddles
+
+  diff_data <- same_saddles %>%
+    mutate(uid = fct_reorder(system_id,.x =.data[[sort_by]],.na_rm = FALSE)) %>%
+    select(mol_id, spin, system_id, uid, sym(comparison_col), sym(diff_in)) %>%
+    pivot_wider(names_from = comparison_col, values_from = diff_in) %>%
+    mutate(
+      diff =.data[[level1]] -.data[[level2]]
+      ## signed_log_diff = sign(diff) * log1p(abs(diff))
+    ) %>%
+    ## filter(abs(diff) < 500) %>%
+    mutate(id = as.numeric(uid)) %>%
+      filter(!is.na(diff)) #Remove NAs directly
+
+  return(diff_data)
+}
+#+end_src
+
+#+begin_src R :results none
+plot_diff_in <- function(df, diff_in, comparison_col,
+                         level1, level2,
+                         diff_name=diff_in,
+                         tolerance = 0.01,
+                         sort_by = "init_energy",
+                         point_color = color("vibrant")(7),
+                         stat_color = colour("muted")) {
+  # Args:
+  #   df: Input data frame.
+  #   comparison_col: Column for comparison (e.g., "method", "dimer_rot").
+  #   level1: First level within comparison_col (e.g., "GPR-Dimer", "cg").
+  #   level2: Second level within comparison_col (e.g., "Sella", "lbfgs").
+  #   tolerance: Maximum allowed difference in barrier heights.
+  # Returns: ggplot object
+
+  # Input validation
+  if (!all(c("success", comparison_col, diff_in, "mol_id", "system_id", "spin", "barrier") %in% colnames(df))) {
+    stop("Input DataFrame must have columns 'success', '", comparison_col,"', ", diff_in, "', 'mol_id', 'system_id' 'spin', and 'barrier'.")
+  }
+  if (!is.numeric(tolerance) || tolerance < 0) {
+    stop("`tolerance` must be a non-negative number.")
+  }
+  if (!is.character(level1) || length(level1) != 1 ||
+      !is.character(level2) || length(level2) != 1) {
+    stop("`level1` and `level2` must be single character strings.")
+  }
+  if (level1 == level2){
+        stop("level1 and level2 must be distinct")
+  }
+      # Check if comparison levels exist
+    if (!all(c(level1, level2) %in% unique(df[[comparison_col]]))) {
+      missing_levels <- setdiff(c(level1, level2), unique(df[[comparison_col]]))
+      stop("Comparison levels not found in the data: ", paste(missing_levels, collapse=", "))
+    }
+
+  find_matching_saddles(df, comparison_col, level2, level1, tolerance) -> same_saddles
+  diff_data <- gen_diff_data(df, diff_in, comparison_col, level1, level2, tolerance, sort_by)
+
+  ## Calculate summary statistics for positive and negative differences separately
+  nsys <- length(unique(same_saddles$system_id))
+  summary_stats <- diff_data %>%
+    summarize(
+      ## mean_pos = mean(diff[diff > 0]),
+      median_pos = median(diff[diff > 0]),
+      max_pos = max(diff[diff > 0]),
+      ## mean_neg = mean(diff[diff < 0]),
+      median_neg = median(diff[diff < 0]),
+      min_neg = min(diff[diff < 0]),
+      percent_pos = (sum(diff > 0) / nsys) * 100, # Count of positive differences
+      percent_neg = (sum(diff < 0) / nsys) * 100  # Count of negative differences
+    ) %>% pivot_longer(
+      cols = everything(),
+      names_to = c("stat", "type"),
+      names_pattern = "(.*)_(pos|neg)",
+      values_to = "value"
+    ) %>%
+    filter(abs(value) != Inf & value !=0)  %>%
+    mutate(
+      stat = str_to_title(stat),
+    ) %>%
+    drop_na()
+
+    # --- Main Plot ---
+    p1 <- ggplot(diff_data, aes(x = id, y = diff)) +
+        geom_line(aes(color = diff), size = 2, alpha = 0.4) +
+        geom_point(aes(color = diff), size = 4, alpha = 0.8) +
+        scale_color_gradientn(
+          colors = point_color,
+          name = "\nSigned Difference",
+        ) +
+      geom_point(data = diff_data, aes(x = id, y = diff), color = "black", size = 1.5, alpha = 0.8) +
+        labs(
+            title = paste(diff_name, " Differences (", level1, " - ", level2, ")\nSame Saddles (", nsys, " systems )"),
+            x = paste("System Index sorted by ", sort_by),
+            y = paste(diff_name, " (", level1, " - ", level2, ")")
+        ) +
+        geom_hline(yintercept = 0, linetype = "dashed", color = "black", size = 1)
+    # Add summary lines and legend
+    p1 <- p1 + new_scale_color() +
+      geom_hline(data = summary_stats %>% filter(stat != "Percent"),
+                 aes(yintercept = value, color = paste(stat, type, sep = "_")),
+                 linetype = "solid", linewidth = 1.8) +
+      geom_hline(data = summary_stats %>% filter(stat == "Percent"),
+                 aes(yintercept = 0, color = paste(stat, type, sep = "_")),
+                 linetype = "blank", linewidth = 1.2) +
+      scale_color_manual(
+        name = "\nSummary Statistics",
+        values = stat_color(summary_stats %>% nrow), ## paste0(summary_stats$stat, "_", summary_stats$type),
+        labels = function(x) {  #This is the key part of the fix
+            stat_type <- strsplit(x, "_")
+            sapply(stat_type, function(st) {
+                stat_name <- st[1]
+                type_name <- st[2]
+                val <- summary_stats$value[summary_stats$stat == stat_name & summary_stats$type == type_name]
+                sprintf(
+                        case_when(
+                          stat_name == "Percent" ~ "%s (%s): %.2f",
+                          .default = "%s (%s): %2i"
+                          ),
+                        str_to_title(stat_name),
+                        case_when(
+                          type_name == "pos" ~ "+",
+                          type_name == "neg" ~ "-",
+                          ),
+                        case_when(
+                          stat_name == "Percent" ~ round(abs(val), 2),
+                          .default = round(abs(val), 0)
+                          )
+                        ) #Format the label
+            })
+        }
+      )
+
+    return(p1)
+}
+#+end_src
+
+Along with the favored line plot.
+
+#+begin_src R :results none
+gen_linecomp_data <- function(df, diff_in, comparison_col, level1, level2, tolerance = 0.01) {
+  # Input validation
+  if (!all(c("success", comparison_col, diff_in, "mol_id", "system_id", "spin", "barrier") %in% colnames(df))) {
+    stop("Input DataFrame must have columns 'success', '", comparison_col,"', ", diff_in, "', 'mol_id', 'system_id' 'spin', and 'barrier'.")
+  }
+  if (!is.numeric(tolerance) || tolerance < 0) {
+    stop("`tolerance` must be a non-negative number.")
+  }
+  if (!is.character(level1) || length(level1) != 1 ||
+      !is.character(level2) || length(level2) != 1) {
+    stop("`level1` and `level2` must be single character strings.")
+  }
+  if (level1 == level2){
+        stop("level1 and level2 must be distinct")
+  }
+      # Check if comparison levels exist
+    if (!all(c(level1, level2) %in% unique(df[[comparison_col]]))) {
+      missing_levels <- setdiff(c(level1, level2), unique(df[[comparison_col]]))
+      stop("Comparison levels not found in the data: ", paste(missing_levels, collapse=", "))
+    }
+
+
+  # Dynamically create column names
+  level1_comp <- paste(level1, diff_in, sep="_")
+  level2_comp <- paste(level2, diff_in, sep="_")
+
+  find_matching_saddles(df, comparison_col, level2, level1, tolerance) -> same_saddles
+  plot_data <- df %>%
+    filter(mol_id %in% same_saddles$mol_id,
+           system_id %in% same_saddles$system_id,
+           spin %in% same_saddles$spin,
+           .data[[comparison_col]] %in% c(level1, level2)) %>%  # Correct way to use comparison_col
+    group_by(mol_id, spin) %>%
+    summarise(
+      !!level1_comp := sum(.data[[diff_in]][.data[[comparison_col]] == level1]),  # Use .data pronoun
+      !!level2_comp := sum(.data[[diff_in]][.data[[comparison_col]] == level2]), # Use .data pronoun
+      .groups = "drop"
+    )
+  return(plot_data)
+}
+#+end_src
+
+Now we can write something to plot this.
+
+#+begin_src R :results none
+plot_linecomp <- function(df, diff_in, comparison_col, level1, level2, diff_name=diff_in, tolerance = 0.01, print_stats=FALSE) {
+                                        # Input validation
+  if (!all(c("success", comparison_col, diff_in, "mol_id", "system_id", "spin", "barrier") %in% colnames(df))) {
+    stop("Input DataFrame must have columns 'success', '", comparison_col,"', ", diff_in, "', 'mol_id', 'system_id' 'spin', and 'barrier'.")
+  }
+  if (!is.numeric(tolerance) || tolerance < 0) {
+    stop("`tolerance` must be a non-negative number.")
+  }
+  if (!is.character(level1) || length(level1) != 1 ||
+      !is.character(level2) || length(level2) != 1) {
+    stop("`level1` and `level2` must be single character strings.")
+  }
+  if (level1 == level2){
+    stop("level1 and level2 must be distinct")
+  }
+                                        # Check if comparison levels exist
+  if (!all(c(level1, level2) %in% unique(df[[comparison_col]]))) {
+    missing_levels <- setdiff(c(level1, level2), unique(df[[comparison_col]]))
+    stop("Comparison levels not found in the data: ", paste(missing_levels, collapse=", "))
+  }
+
+                                        # Dynamically create column names
+  level1_comp <- paste(level1, diff_in, sep="_")
+  level2_comp <- paste(level2, diff_in, sep="_")
+  level2_better <- paste(level2, "better", sep="_")
+
+  plot_data <- gen_linecomp_data(df, diff_in, comparison_col, level1, level2, tolerance)
+
+  plot_data %>%
+    mutate(
+      worse = case_when(
+        !!sym(level1_comp) > !!sym(level2_comp) ~ level1, # Use sym() for dynamic column names
+        !!sym(level1_comp) < !!sym(level2_comp) ~ level2,
+        TRUE ~ "Equal"  # Handle equality
+      ),
+      worse = as.factor(worse)
+    )->plot_data
+
+  ## Calculate statistics for annotation
+  summary_stats <- plot_data %>%
+    summarize(
+      total_cases = n(),
+      !!level2_better := sum(worse == level1),
+      percentage_better = round(.data[[level2_better]] / total_cases * 100, 2),
+      mean_level1 = mean(.data[[level1_comp]]),
+      median_level1 = median(.data[[level1_comp]]),
+      mode_level1 = as.numeric(names(sort(table(.data[[level1_comp]]), decreasing=TRUE)[1])), #Mode.
+      mean_level2 = mean(.data[[level2_comp]]),
+      median_level2 = median(.data[[level2_comp]]),
+      mode_level2 = as.numeric(names(sort(table(.data[[level2_comp]]), decreasing = TRUE)[1])), #Mode
+      )
+
+  p1 <- ggplot(plot_data, aes(x = .data[[level1_comp]], y = .data[[level2_comp]], color = worse)) +
+    geom_point(size=rel(2.8)) +
+    geom_abline(slope = 1, intercept = 0, size=rel(1.8), alpha=0.4) +
+    labs(x = paste(toupper(level1), diff_name), y = paste(toupper(level2), diff_name),
+         title = paste0(diff_name, " (", nrow(plot_data), " systems)\nSame Saddles\n", toupper(level2), " better in ", summary_stats$percentage_better, "% and ", toupper(level1), " better in ", (100-summary_stats$percentage_better), " %")) +
+    theme(legend.position = "bottom")
+  ## Add mean, median, and mode for level1
+  if (print_stats) (
+    p1 +
+    annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.5,
+             label = paste0(toupper(level1), ":\nMean = ",   comma(round(summary_stats$mean_level1, 2)),
+                            "\nMedian = ", comma(round(summary_stats$median_level1,2)),
+                            "\nMode = ",   comma(round(summary_stats$mode_level1,  2))),
+             size = 3, color = "blue") +
+                                        # Add mean, median, and mode for level2
+    annotate("text", y = -Inf, x = Inf, hjust = 1.1, vjust = -0.5,
+             label = paste0(toupper(level2), ":\nMean = ",   comma(round(summary_stats$mean_level2, 2)),
+                            "\nMedian = ", comma(round(summary_stats$median_level2,2)),
+                            "\nMode = ",   comma(round(summary_stats$mode_level2,2))
+                            ),
+             size = 3, color = "red")
+  )
+  return(p1)
+}
+#+end_src
+
+We also like histograms.
+
+#+begin_src R :results none
+plot_distribution <- function(df, x_col, group_col, level1, level2,
+                              x_label = x_col, title = "Distribution") {
+  # Creates a histogram for a numeric column, faceted by a categorical column.
+
+  # Args:
+  #   df: The input data frame.
+  #   x_col: The name of the numeric column to plot (as a string).
+  #   group_col: The name of the categorical column for grouping (e.g., "method").
+  #   level1: The first level within group_col (for coloring).
+  #   level2: The second level within group_col (for coloring).
+  #   x_label: Label for the x-axis (defaults to the column name).
+  #   title:  Plot title (defaults to "Distribution").
+
+  # Input validation
+  if (!all(c(x_col, group_col, "mol_id") %in% colnames(df))) {
+    stop("Data frame must contain columns: ", x_col, ", ", group_col, ", and mol_id")
+  }
+  if (!is.character(level1) || length(level1) != 1 ||
+      !is.character(level2) || length(level2) != 1) {
+    stop("`level1` and `level2` must be single character strings.")
+  }
+    # Check if comparison levels exist
+    if (!all(c(level1, level2) %in% unique(df[[group_col]]))) {
+      missing_levels <- setdiff(c(level1, level2), unique(df[[group_col]]))
+      stop("Comparison levels not found in the data: ", paste(missing_levels, collapse=", "))
+    }
+
+  # Prepare data: Filter for the two levels of interest and make group_col a factor
+  plot_data <- df %>%
+    filter(.data[[group_col]] %in% c(level1, level2), success == TRUE) %>%
+        mutate(!!sym(group_col) := factor(.data[[group_col]], levels = c(level1, level2)))
+
+  # Summary statistics
+  summary_stats <- plot_data %>%
+    group_by(.data[[group_col]]) %>%
+    summarize(
+      mean_val = mean(.data[[x_col]]),
+      median_val = median(.data[[x_col]]),
+      min_val = min(.data[[x_col]]),
+      max_val = max(.data[[x_col]]),
+      nsys = n(),
+      .groups = "drop"
+    )
+
+    # Get y-axis limits AFTER summarizing.
+    max_count <- max(table(plot_data[[x_col]])) # Approximate max count.
+    y_pos_stats <- max_count * 0.8  # Adjust vertical position as needed
+    y_pos_n <- max_count * 0.6
+
+  # Create the plot
+  p <- ggplot(plot_data, aes(x = .data[[x_col]], fill = .data[[group_col]])) +
+        geom_histogram(bins = 50) + # Remove position=identity
+        geom_density()+
+    geom_vline(aes(xintercept = mean_val, color = "Mean"), data = summary_stats, linetype = "dashed") +
+    geom_vline(aes(xintercept = median_val, color = "Median"), data = summary_stats, linetype = "dashed") +
+    geom_vline(aes(xintercept = min_val, color = "Min"), data = summary_stats, linetype = "dashed") +
+    geom_vline(aes(xintercept = max_val, color = "Max"), data = summary_stats, linetype = "dashed") +
+    scale_color_manual(
+      name="Metric",
+      values = c("Mean" = "blue", "Median" = "red", "Min" = "dark green", "Max" = "black")
+    ) +
+    geom_text(data = summary_stats, aes(x = 220, y = 90,
+                                        label = paste0(
+                                          "Mean: ", round(mean_val, 2),
+                                          "\nMedian: ", round(median_val, 2),
+                                          "\nMin: ", round(min_val, 2),
+                                          "\nMax: ", round(max_val, 2)
+                                        )),
+               size = 3) +
+    geom_text(data = summary_stats, aes(x = 600, y = 150, label = paste0(nsys, " systems")), size = 3) +
+        labs(x = x_label, y = "Count", fill = group_col, color = group_col,
+             title = paste(title, "\n(50 bins)")) +
+        theme(legend.position = "bottom") +
+        facet_wrap(vars(.data[[group_col]]), ncol = 1, scales = "free_y")  # Facet by method, separate y-scales
+
+  return(p)
+}
+#+end_src
+
+** Theme
+
+Along with a modified theme initially [[https://rpubs.com/Koundy/71792][from here]].
+
+We'd like to use more of the hyperlegible fonts.
+#+begin_src R :results discard
+library(showtext)
+library(sysfonts)
+font_add_google("Atkinson Hyperlegible", "Atkinson")
+showtext_auto()
+#+end_src
+
+#+RESULTS:
+
+#+begin_src R :results none
+# Matplotlib has floralwhite which is FFFAF0, but FAF7F0 is a bit nicer
+# Actually for the paper, just stick to #FFFFFF
+theme_Publication <- function(base_size = 36, base_family = "Atkinson") {
+  library(grid)
+  library(ggthemes)
+  (theme_foundation(base_size = base_size, base_family = base_family)
+  + theme(
+      plot.title = element_text(
+        face = "bold",
+        size = rel(2.2), hjust = 0.5
+      ),
+      text = element_text(),
+      panel.background = element_rect(colour = NA, fill = "#FFFFFF"),
+      plot.background = element_rect(colour = NA, fill = "#FFFFFF"),
+      plot.tag = element_text(face = "bold"),
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 1),
+      axis.title = element_text(face = "bold", size = rel(1.8)),
+      axis.title.y = element_text(angle = 90, vjust = 2),
+      axis.title.x = element_text(vjust = -0.2),
+      axis.text = element_text(size = rel(1.8)),
+      axis.line = element_line(colour = "black"),
+      axis.ticks = element_line(),
+      panel.grid.major = element_line(colour = "#e6e3dd"),
+      panel.grid.minor = element_blank(),
+      legend.background = element_rect(fill = "#FFFFFF", colour = NA),
+      legend.key = element_rect(colour = NA, fill = "#FFFFFF"),
+      legend.position = "right",
+      legend.direction = "vertical",
+      legend.key.size = unit(0.8, "cm"),
+      legend.margin = margin(unit(0, "cm")),
+      legend.title = element_text(face = "italic", size = rel(1.6)),
+      legend.text = element_text(size = rel(1.8)),
+      plot.margin = unit(c(10, 5, 5, 5), "mm"),
+      strip.background = element_rect(colour = "#FFFFFF", fill = "#FFFFFF"),
+      strip.text = element_text(face = "bold", size = rel(1.5))
+    ))
+}
+
+## TODO(rg): These are basically the Okabe-Ito ones, from Khroma
+okabe_ito_colors <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7", "#999999")
+scale_fill_Publication <- function(...) {
+  library(scales)
+  discrete_scale("fill", "Publication", manual_pal(values = okabe_ito_colors), ...)
+}
+
+scale_color_Publication <- function(...) {
+  library(scales)
+  discrete_scale("color", "Publication", manual_pal(values = okabe_ito_colors), ...)
+}
+#+end_src
+
+** Success plot aids
+
+#+begin_src R :results none discard
+#' Generate Comparison Data for Binary Success (-1, 0, 1) - Direct Method
+#'
+#' Prepares data for plotting success outcomes (-1, 0, 1) between two levels
+#' for the same system ID. It directly checks for the presence of both levels
+#' for each system, ignoring whether they reached the same final state.
+#'
+#' @param df Input data frame.
+#' @param system_id_cols Character vector: Names of columns that uniquely identify a system (e.g., c("mol_id", "system_id", "spin")).
+#' @param comparison_col Character string: Name of the column distinguishing the levels.
+#' @param level1 Character string: The first level for comparison.
+#' @param level2 Character string: The second level for comparison.
+#' @param success_col Character string: Name of the success column (0/1 or FALSE/TRUE).
+#' @param sort_by_col Character string: Numeric column name to sort systems by. We will use the median value per system if multiple runs exist.
+#'
+#' @return A tibble with comparison results (-2, -1, 0, 1) for systems where both levels were run
+#' @export
+generate_success_comparison_direct <- function(df,
+                                               system_id_cols,
+                                               comparison_col,
+                                               level1,
+                                               level2,
+                                               success_col = "success",
+                                               sort_by_col = "rmsd_init_saddle") {
+
+  # --- Input Validation ---
+  required_cols <- c(system_id_cols, comparison_col, success_col, sort_by_col)
+  if (!all(required_cols %in% names(df))) {
+    missing <- setdiff(required_cols, names(df))
+    stop("Input DataFrame missing required columns: ", paste(missing, collapse=", "))
+  }
+  if (!is.numeric(df[[sort_by_col]])) {
+      stop("`sort_by_col` ('", sort_by_col, "') must be numeric.")
+  }
+  # Convert success to numeric 0/1 if necessary
+  if (!is.logical(df[[success_col]]) && !all(na.omit(df[[success_col]]) %in% c(0, 1))) {
+     warning("Converting '", success_col, "' to numeric 0/1 (assuming 0=Fail, non-zero=Success).")
+     df <- df %>% mutate(!!sym(success_col) := ifelse(is.na(.data[[success_col]]), NA, as.numeric(.data[[success_col]] != 0)))
+  } else if (is.logical(df[[success_col]])) {
+     df <- df %>% mutate(!!sym(success_col) := as.numeric(.data[[success_col]]))
+  }
+  # Check if levels exist
+  available_levels <- unique(df[[comparison_col]])
+  if (!all(c(level1, level2) %in% available_levels)) {
+      missing_levels <- setdiff(c(level1, level2), available_levels)
+      stop("Specified levels not found in '", comparison_col, "': ", paste(missing_levels, collapse=", "))
+  }
+  # --- End Validation ---
+
+  # Define success column names for pivoting
+  level1_success_col <- paste0("success_", level1)
+  level2_success_col <- paste0("success_", level2)
+
+  # --- Data Processing ---
+  comparison_data <- df %>%
+    # Keep only relevant levels
+    filter(.data[[comparison_col]] %in% c(level1, level2)) %>%
+    # Group by system ID
+    group_by(across(all_of(system_id_cols))) %>%
+    # Keep only systems that have results for BOTH level1 AND level2
+    filter(all(c(level1, level2) %in% .data[[comparison_col]])) %>%
+    # Handle potential multiple runs per system/level:
+    # Consider successful if ANY run succeeded for that system/level.
+    # Also calculate the median sort_by value for consistent ordering.
+    group_by(across(all_of(c(system_id_cols, comparison_col)))) %>%
+    summarise(
+        !!sym(success_col) := max(.data[[success_col]], na.rm = TRUE), # 1 if any success, 0 if all fail, -Inf if all NA
+        median_sort_value = median(.data[[sort_by_col]], na.rm = TRUE),
+        .groups = "drop"
+    ) %>%
+    # Handle -Inf case from max(NA, na.rm=TRUE) -> replace with NA or 0? Let's use NA
+    mutate(!!sym(success_col) := if_else(is.infinite(.data[[success_col]]), NA_real_, .data[[success_col]])) %>%
+    # Pivot wider to get level1 and level2 success in columns
+    pivot_wider(
+        id_cols = all_of(system_id_cols),
+        names_from = all_of(comparison_col),
+        values_from = all_of(success_col),
+        names_prefix = "success_"
+    ) %>%
+    # Also carry over the median sort value (need to handle potential differing values from pivot)
+    # Let's recalculate median sort value *per system* after the pivot prep
+    # Join back the median sort value (average across levels for the system)
+    left_join(
+        df %>%
+            group_by(across(all_of(system_id_cols))) %>%
+            summarise(median_sort_value = median(.data[[sort_by_col]], na.rm = TRUE), .groups = "drop"),
+        by = system_id_cols
+    ) %>%
+    # Filter out rows where either level's success is NA after pivoting/summarising
+    filter(!is.na(.data[[level1_success_col]]) & !is.na(.data[[level2_success_col]])) %>%
+    # *** Calculate the -2, -1, 0, 1 difference ***
+    mutate(
+      success_diff = case_when(
+        .data[[level1_success_col]] == 0 & .data[[level2_success_col]] == 0 ~ -2, # Both Failed
+        .data[[level1_success_col]] == 0 & .data[[level2_success_col]] == 1 ~ -1, # Level2 only Succeeded
+        .data[[level1_success_col]] == 1 & .data[[level2_success_col]] == 1 ~ 0,  # Both Succeeded
+        .data[[level1_success_col]] == 1 & .data[[level2_success_col]] == 0 ~ 1,  # Level1 only Succeeded
+        TRUE ~ NA_real_ # Should not happen given filter above, but safe practice
+      )
+    ) %>%
+    # Order rows by the median sort value for consistent plotting order
+    arrange(median_sort_value) %>%
+    # Add a simple numeric ID for the x-axis
+    mutate(id = row_number()) %>%
+    # Select relevant columns for output
+    select(all_of(system_id_cols), id, median_sort_value,
+           !!level1_success_col, !!level2_success_col, success_diff)
+
+  # Handle cases where no systems remain after filtering
+   if (nrow(comparison_data) == 0) {
+        warning("No systems found meeting the criteria (both levels run & at least one succeeded).")
+   }
+
+  return(comparison_data)
+}
+#+end_src
+
+#+RESULTS:
+
+#+begin_src R :results none discard
+#' Plot Binary Success Comparison (-2, -1, 0, 1) for ALL Systems
+#'
+#' using data from `generate_comparison_all_systems_case`. Shows all systems ordered.
+#' Systems missing a level are shown distinctly (default: small grey dot near y=0).
+#'
+#' @param df Input data frame (raw data).
+#' @param system_id_cols Character vector: Names of columns identifying a system.
+#' @param comparison_col Character string: Column distinguishing the levels.
+#' @param level1 Character string: The first level for comparison.
+#' @param level2 Character string: The second level for comparison.
+#' @param success_col Character string: Success column name.
+#' @param sort_by_col Character string: Column name to sort systems by.
+#' @param point_colors Character vector: 5 Colors for {-2, -1, 0, 1, NA}.
+#'        Defaults provided for Fail, L2Win, BothWin, L1Win. NA uses separate aesthetic.
+#' @param show_summary_text Boolean: Add annotation with counts/percentages?
+#' @param na_marker_color Color for points where comparison is NA (Missing Level).
+#' @param na_marker_shape Shape for points where comparison is NA.
+#' @param na_marker_size Size for points where comparison is NA.
+#' @param na_y_position Y-value at which to plot NA markers. Default 0.
+#'
+#' @return A list of a ggplot object and summary text.
+#' @export
+plot_success_comp <- function(df,
+                              system_id_cols,
+                              comparison_col,
+                              level1,
+                              level2,
+                              level_names = c(level1, level2),
+                              success_col = "success",
+                              sort_by_col = "rmsd_init_saddle",
+                              point_colors = c("orange", "red", "grey50", "blue"), # Order: -2, -1, 0, 1
+                              show_summary_text = TRUE,
+                              na_marker_color = "grey70",
+                              na_marker_shape = 1,
+                              na_marker_size = 1.5,
+                              na_y_position = 0) {
+  # Generate the comparison data including ALL systems and -2 for 'Both Failed'
+  plot_data <- generate_success_comparison_direct(
+    df, system_id_cols, comparison_col,
+    level1, level2, success_col, sort_by_col
+  )
+
+  if (nrow(plot_data) == 0) {
+    warning("No systems found in the input data.")
+    return(list(
+      plot = ggplot() +
+        labs(title = "No Systems Found") +
+        theme_void(),
+      summary_text = "No systems found in input data."
+    ))
+  }
+
+  # Separate data for plotting NA (Missing Level) vs non-NA comparison results
+  plot_data_na <- plot_data %>% filter(is.na(success_diff))
+  plot_data_compare <- plot_data %>% filter(!is.na(success_diff)) # Includes -2, -1, 0, 1
+
+  # --- Calculate Summary Stats (only on systems where comparison was done) ---
+  summary_text <- ""
+  n_compared <- nrow(plot_data_compare)
+  n_total <- nrow(plot_data)
+  n_na_level <- nrow(plot_data_na) # Systems missing a level
+
+  if (n_compared > 0) {
+    # Define factor levels and labels including -2
+    outcome_levels <- c(-2, -1, 0, 1)
+    outcome_labels <- c("Both Failed", paste(level2, "only"), "Both Succeeded", paste(level1, "only"))
+
+    summary_stats <- plot_data_compare %>%
+      count(success_diff) %>%
+      # Ensure all potential outcomes are present for correct % calculation and labelling
+      tidyr::complete(success_diff = outcome_levels, fill = list(n = 0)) %>%
+      filter(!is.na(success_diff)) %>% # Remove potential NA row from complete() if input had NAs
+      mutate(
+        percentage = (n / n_compared) * 100, # Pct of systems where comparison ran
+        # Use pre-defined labels based on outcome_levels
+        label = factor(success_diff, levels = outcome_levels, labels = outcome_labels)
+      )
+
+    summary_text <- summary_stats %>%
+      arrange(success_diff) %>%
+      mutate(text_line = sprintf("%s: %d (%.1f%%)", label, n, percentage)) %>%
+      pull(text_line) %>%
+      paste(collapse = "\n")
+    summary_text <- paste0(summary_text, sprintf("\nMissing Level: %d", n_na_level))
+    subtitle_text <- paste(n_total, "total systems;", n_compared, "compared;", n_na_level, "missing a level")
+  } else if (show_summary_text) {
+    summary_text <- sprintf("Missing Level: %d", n_na_level)
+    subtitle_text <- paste(n_total, "total systems;", n_compared, "compared;", n_na_level, "missing a level")
+  } else {
+    subtitle_text <- element_blank()
+  }
+
+
+  plot_levels <- c(-2, -1, 0, 1)
+  plot_labels <- c("Both :: F", paste(level_names[2], "only"), "Both :: P", paste(level_names[1], "only"))
+  plot_colors <- setNames(point_colors, plot_levels)
+  yaxis_labels <- c("Both :: F", paste(level_names[2], ":: F"), "Both :: P", paste(level_names[1], " :: P"))
+
+  # --- Plotting ---
+  p1 <- ggplot(mapping = aes(x = id)) +
+    # Layer 1: Points for systems where comparison is NA (Missing Level)
+    geom_point(
+      data = plot_data_na, aes(y = na_y_position),
+      color = na_marker_color, shape = na_marker_shape, size = na_marker_size, alpha = 0.6
+    ) +
+    # Layer 2: Points for systems with valid comparison (-2, -1, 0, 1)
+    geom_point(
+      data = plot_data_compare, aes(y = success_diff, color = factor(success_diff, levels = plot_levels)),
+      size = 2.5, alpha = 0.8
+    ) +
+    # Scales and Labels
+    scale_color_manual(
+      name = "Outcome",
+      values = plot_colors,
+      labels = plot_labels,
+      na.translate = FALSE, # Don't show NA (missing level) in this legend
+      drop = FALSE # Keep all levels in legend even if not present in data
+    ) +
+    scale_y_continuous(
+      breaks = plot_levels,
+      labels = yaxis_labels,
+      limits = c(min(plot_levels) - 0.4, max(plot_levels) + 0.4) # Adjust limits dynamically
+    ) +
+    labs(
+      title = paste("Success Comparison:", level1, "vs", level2),
+      subtitle = subtitle_text,
+      x = paste("System Index (ordered by median", sort_by_col, ")"),
+      y = element_blank()
+    ) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+
+  # Add summary annotation
+  if (show_summary_text && nchar(summary_text) > 0) {
+    p1 <- p1 + annotate(
+      geom = "text", x = Inf, y = Inf, label = summary_text,
+      hjust = 1.05, vjust = 1.1, size = 3, lineheight = 0.9, colour = "grey30"
+    )
+  }
+
+  return(list(plot = p1, summary_text = paste0(summary_text, "\n", subtitle_text)))
+}
+#+end_src
+
+#+RESULTS:
+
+With a new helper:
+
+#+begin_src R :results none discard
+parse_success_comp_summary <- function(summary_text, comparison_name) {
+  tibble(raw = str_split(summary_text, "\n")[[1]]) %>%
+    filter(str_detect(raw, ":")) %>%
+    separate(raw, into = c("Outcome", "Stats"), sep = ": ") %>%
+    mutate(
+      Count = as.numeric(str_extract(Stats, "\\d+")),
+      Pct = str_extract(Stats, "[\\d\\.]+%")
+    ) %>%
+    select(Outcome, Count, Pct) %>%
+    mutate(Comparison = comparison_name)
+}
+#+end_src
+
+** Quality plot aids
+#+begin_src R :results none discard
+#' Generate a Stacked Bar Chart and Summary Data for Saddle Point Comparisons
+#'
+#' This function compares a primary computational method against one or more
+#' competitor methods. It calculates statistics on comparable systems (where both
+#' methods succeeded) and categorizes outcomes.
+#'
+#' @param df The input dataframe. Must contain columns for system_id, success,
+#'   the comparison column (e.g., 'method'), and the value column (e.g., 'barrier').
+#' @param primary_method A string with the name of the main method to compare against.
+#' @param competitor_methods A character vector of competitor method names.
+#' @param comparison_col The name of the column that contains the method labels (e.g., "method").
+#' @param value_col The name of the column with the energy barrier values (e.g., "barrier").
+#' @param system_id_col The column identifying each unique chemical system (e.g., "system_id").
+#' @param tolerance A numeric value for the maximum allowed difference for barriers to be considered "matched".
+#'
+#' @return A list containing two elements:
+#'   1. `plot`: A ggplot object for the visualization.
+#'   2. `summary_df`: A tidy dataframe with detailed counts and percentages.
+
+generate_saddle_comparison_plot <- function(df,
+                                            primary_method,
+                                            competitor_methods,
+                                            tolerance = 0.5,
+                                            comparison_col = "method",
+                                            value_col = "barrier",
+                                            inline_text_size = 22,
+                                            system_id_col = "system_id") {
+
+  # --- 1. Data Processing Loop ---
+  # Iterate over each competitor to build a summary dataframe for plotting
+  all_summaries <- lapply(competitor_methods, function(competitor) {
+
+    # Filter for successful runs of the two methods being compared
+    wide_df <- df %>%
+      filter(success == TRUE, .data[[comparison_col]] %in% c(primary_method, competitor)) %>%
+      # Pivot to get barriers for each method in the same row
+      pivot_wider(
+        id_cols = all_of(system_id_col),
+        names_from = all_of(comparison_col),
+        values_from = all_of(value_col)
+      ) %>%
+      # Keep only "comparable systems" where both methods succeeded
+      na.omit()
+
+    # Get the total number of comparable systems for this pair
+    total_comparable <- nrow(wide_df)
+    if (total_comparable == 0) return(NULL) # Skip if no comparable systems
+
+    # --- 2. Categorize Outcomes ---
+    summary_df <- wide_df %>%
+      mutate(
+        # Calculate the absolute difference in barrier energy
+        diff = .data[[primary_method]] - .data[[competitor]],
+        # Assign an outcome category based on the difference and tolerance
+        outcome = case_when(
+          abs(diff) <= tolerance ~ "Equal",
+          diff < 0 ~ primary_method,
+          TRUE ~ competitor
+        )
+      ) %>%
+      # Count the number of systems in each outcome category
+      count(outcome) %>%
+      # Add metadata for plotting
+      mutate(
+        comparison_pair = paste(primary_method, "vs", competitor),
+        total_comparable = total_comparable,
+        percentage = (n / total_comparable) * 100
+      )
+
+    return(summary_df)
+  })
+
+  # Combine all the individual summaries into one dataframe
+  summary_df <- bind_rows(all_summaries)
+
+  # Handle case where no comparable systems were found at all
+  if (is.null(summary_df) || nrow(summary_df) == 0) {
+    warning("No comparable systems found for any of the requested pairs.")
+    return(list(
+      plot = ggplot() + labs(title = "No Comparable Systems Found") + theme_void(),
+      summary_df = tibble()
+    ))
+  }
+
+  # --- 3. Create the Plot ---
+  # Define the order of outcomes for the stacked bar chart
+  outcome_levels <- c(
+    competitor_methods,
+    primary_method,
+    "Equal"
+  )
+  summary_df$outcome <- factor(summary_df$outcome, levels = unique(outcome_levels))
+
+  # Create a helper dataframe for the "N = ..." labels
+  n_labels <- summary_df %>%
+    distinct(comparison_pair, total_comparable)
+
+  # Create the named vector for colors dynamically and correctly.
+  competitor_lower_barrier_names <- competitor_methods
+  # Define colors for as many competitors as provided
+  competitor_colors <- c("#FF7F00", "#FDBF6F", "#984EA3", "#FFFF33")[1:length(competitor_methods)]
+
+  color_values <- c(
+    setNames("#3B75AF", "Equal"),
+    setNames("#E41A1C", primary_method),
+    setNames(competitor_colors, competitor_lower_barrier_names)
+  )
+
+  # Build the ggplot object
+  p <- ggplot(summary_df, aes(x = comparison_pair, y = percentage, fill = outcome)) +
+    geom_bar(stat = "identity", width = 0.6) +
+    # Add percentage labels inside the bars
+    geom_text(
+      aes(label = sprintf("%.1f%%", percentage)),
+      position = position_stack(vjust = 0.5),
+      color = "white",
+      size = inline_text_size,
+      fontface = "bold"
+    ) +
+    # Add "N = ..." labels above the bars
+    geom_text(
+      data = n_labels,
+      aes(x = comparison_pair, label = paste("N =", total_comparable), y = 103),
+      inherit.aes = FALSE,
+      size = inline_text_size
+    ) +
+    # Use the correctly created color vector
+    scale_fill_manual(
+      name = "Lower Barrier",
+      values = color_values,
+      drop = FALSE
+    ) +
+    scale_y_continuous(limits = c(0, 108), breaks = seq(0, 100, 25)) +
+    # Apply a clean theme and customize labels
+    labs(
+      title = "Unified Quality Metric: Saddle Agreement & Disagreement Resolution",
+      subtitle = paste("Analysis of all comparable systems, segmented by", value_col, "energy"),
+      x = "Comparison Pair",
+      y = "Percentage of Total Comparable Systems"
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5, size = 11),
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_line(color = "black"),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      legend.position = "bottom"
+    )
+
+  return(list(plot = p, summary_df = summary_df))
+}
+#+end_src
+
+#+RESULTS:
+
+Maybe even better separated into a diverging bar plot and equality section together.
+
+#+begin_src R :results none
+#' Generate a Bar Chart for Method Agreement (with N-count)
+#'
+#' This function creates a simple bar chart to visualize the percentage of cases
+#' where the methods agreed ("Equal" outcome), and adds the total comparable
+#' system count (N) for each pair.
+#'
+#' @param summary_df A data frame with summary results, including 'outcome', 'percentage', and 'n'.
+#' @return A ggplot object.
+generate_agreement_plot_with_n <- function(summary_df, inline_text_size = 22) {
+  # Filter for agreement data
+  agreement_data <- summary_df %>%
+    filter(outcome == "Equal")
+
+  # Calculate the total N for each comparison pair (regardless of outcome)
+  n_data <- summary_df %>%
+    group_by(comparison_pair) %>%
+    summarise(total_n = first(total_comparable)) # total_comparable is the total N
+
+  # Join N data back to the agreement data for plotting
+  plot_data <- left_join(agreement_data, n_data, by = "comparison_pair")
+
+  p <- ggplot(plot_data, aes(x = comparison_pair, y = percentage)) +
+    geom_col(aes(fill = "Equal"), width = 0.6) +
+    # 1. Add N-count label above the bar
+    geom_text(
+      aes(label = paste0("N=", total_n)),
+      # Place N slightly higher than the percentage label
+      vjust = -0.5,
+      color = "black",
+      size = inline_text_size
+    ) +
+    geom_text(
+      aes(label = sprintf("%.1f%%", percentage)),
+      vjust = 5.4,
+      color = "white",
+      fontface = "bold",
+      size = inline_text_size
+    ) +
+    scale_fill_manual(
+      name = "Barrier",
+      values = c("Equal" = "#3B75AF")
+    ) +
+    scale_y_continuous(limits = c(0, 100 * 1.05), breaks = seq(0, 100, 25)) +
+    labs(
+      title = "Overall Agreement",
+      subtitle = "% of systems with same saddle point",
+      x = NULL,
+      y = "Percentage (%)"
+    ) +
+    theme_classic(base_size = 16) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5, size = 12, margin = margin(b = 10)),
+      axis.line.x = element_blank(),
+      axis.ticks.x = element_blank()
+    )
+  return(p)
+}
+
+
+#' Generate a Diverging Bar Chart for Method Disagreement
+#'
+#' This function creates a diverging bar chart to compare the performance of a primary method
+#' against competitor methods, focusing on which method found a lower energy barrier
+#' when they disagreed.
+#'
+#' @param summary_df A data frame containing the summarized comparison results.
+#'   Must include 'comparison_pair', 'outcome', 'percentage', and 'n' columns.
+#'   This is the `summary_df` generated by your original function.
+#' @param primary_method A character string for the name of the primary method (e.g., "OTGPD").
+#' @return A ggplot object representing the diverging bar chart.
+generate_diverging_disagreement_plot <- function(summary_df, primary_method, inline_text_size = 22) {
+  # --- 1. Data Preparation ---
+  diverging_data <- summary_df %>%
+    filter(outcome != "Equal") %>%
+    mutate(
+      plot_percentage = if_else(
+        outcome == primary_method,
+        percentage,
+        -percentage
+      ),
+      outcome_label = trimws(outcome)
+    )
+
+  # --- 2. Color and Legend Setup ---
+  color_mapping <- diverging_data %>%
+    distinct(outcome_label) %>%
+    mutate(color = case_when(
+      outcome_label == primary_method ~ "#E41A1C", # OTGPD color
+      grepl("GPDimer", outcome_label) ~ "#FF7F00",   # GPDimer color
+      grepl("Dimer", outcome_label) ~ "#FDBF6F", # Dimer color
+      TRUE ~ "grey50"
+    )) %>%
+    {
+      setNames(.$color, .$outcome_label)
+    }
+
+  # --- 3. Create the Plot ---
+  max_abs_val <- max(abs(diverging_data$plot_percentage), na.rm = TRUE)
+  plot_limit <- ceiling(max_abs_val / 5) * 5
+
+  p <- ggplot(diverging_data, aes(
+    x = plot_percentage,
+    y = reorder(comparison_pair, plot_percentage),
+    fill = outcome_label
+  )) +
+    geom_vline(xintercept = 0, color = "grey70", linetype = "dashed") +
+    geom_col(width = 0.6) +
+    geom_text(
+      aes(label = sprintf("%.1f%%", abs(plot_percentage))),
+      hjust = if_else(diverging_data$plot_percentage > 0, 1.2, -0.2),
+      color = "black",
+      size = inline_text_size
+    ) +
+    ## annotate("text", x = plot_limit, y = length(unique(diverging_data$comparison_pair)) + 0.5, label = paste(primary_method, "Lower"), hjust = 1, fontface = "bold", size = 5) +
+    ## annotate("text", x = -plot_limit, y = length(unique(diverging_data$comparison_pair)) + 0.5, label = "Competitor Lower", hjust = 0, fontface = "bold", size = 5) +
+    scale_fill_manual(name = "Lower Barrier", values = color_mapping) +
+    scale_x_continuous(
+      limits = c(-plot_limit, plot_limit) * 1.2,
+      breaks = seq(-plot_limit, plot_limit, by = 5),
+      labels = function(x) paste0(abs(x), "%")
+    ) +
+    labs(
+      title = "Disagreement Breakdown",
+      subtitle = "Who finds the lower barrier?",
+      x = "Percentage of Total Systems",
+      y = NULL
+    ) +
+    theme_minimal(base_size = 16) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5, size = 12, margin = margin(b = 10)),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor.x = element_blank(),
+      axis.text.y = element_text(face = "bold"),
+      legend.position = "bottom"
+    )
+  return(p)
+}
+#+end_src
+
+** Performance plot aids
+
+Using the Dolan and Moré 2001 style performance plot.
+
+#+begin_src R :results none
+#' Create a Publication-Quality Performance Profile Plot
+#'
+#' This function generates a formal performance profile to benchmark a set of
+#' solvers. It correctly handles failures by creating plateaus at a solver's
+#' success rate and allows for both linear and log-scaled axes.
+#'
+#' @param df A dataframe containing the benchmark results.
+#' @param problem_cols A character vector of column names that uniquely identify a problem (e.g., c("mol_id", "spin")).
+#' @param method_col The unquoted name of the column containing the solver/method names.
+#' @param time_col The unquoted name of the column with the performance metric (e.g., tot_time).
+#' @param success_col The unquoted name of the column indicating success (must be TRUE/FALSE).
+#' @param log_scale A logical value. If TRUE (default), the x-axis is on a log2 scale. If FALSE, it's linear.
+#' @param x_limit A numeric value setting the upper limit for the x-axis.
+#' @param title An optional title for the plot.
+#'
+#' @return A ggplot object representing the performance profile.
+#' @import ggplot2
+#' @import dplyr
+
+
+create_performance_profile <- function(df,
+                                       problem_cols,
+                                       method_col,
+                                       metric_col,
+                                       success_col,
+                                       log_scale = TRUE,
+                                       x_limit = NULL,
+                                       metric_name = "Time",
+                                       title = "Performance Profile") {
+  # Ensure columns are treated as symbols for tidy evaluation
+  method_col_sym <- rlang::ensym(method_col)
+  metric_col_sym <- rlang::ensym(metric_col)
+  success_col_sym <- rlang::ensym(success_col)
+
+  # --- 1. Data Processing ---
+  all_problems <- df %>% dplyr::distinct(dplyr::across(dplyr::all_of(problem_cols)))
+
+  performance_ratios <- df %>%
+    dplyr::select(!!method_col_sym, dplyr::all_of(problem_cols), !!metric_col_sym, !!success_col_sym) %>%
+    tidyr::complete(!!method_col_sym, all_problems) %>%
+    dplyr::mutate(time_val = dplyr::if_else(is.na(!!success_col_sym) | !!success_col_sym == FALSE, Inf, !!metric_col_sym))
+
+  best_times <- performance_ratios %>%
+    dplyr::filter(is.finite(time_val)) %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(problem_cols))) %>%
+    dplyr::summarise(best_time = min(time_val, na.rm = TRUE), .groups = "drop")
+
+  ## Calculate the performance ratio (tau) for each method on each problem.
+  plot_data <- performance_ratios %>%
+    dplyr::left_join(best_times, by = problem_cols) %>%
+    dplyr::mutate(ratio = time_val / best_time)
+
+  # --- 2. Manually Calculate ECDF for Plotting ---
+  plot_data_ecdf <- plot_data %>%
+    dplyr::group_by(!!method_col_sym) %>%
+    dplyr::arrange(ratio) %>%
+    dplyr::mutate(proportion = (1:dplyr::n()) / dplyr::n()) %>%
+    dplyr::ungroup()
+
+  # --- 3. Prepare Final Data for Clean Geom_step ---
+  ## Create a clean dataset that has exactly one point at ratio = 1 representing
+  ## the win rate.
+  ##
+  ## Find the maximum proportion for methods that were the best
+  ## (ratio = 1). This is the win rate.
+  wins <- plot_data_ecdf %>%
+    dplyr::filter(ratio == 1) %>%
+    dplyr::group_by(!!method_col_sym) %>%
+    dplyr::summarise(proportion = max(proportion), .groups = "drop") %>%
+    dplyr::mutate(ratio = 1)
+  others <- plot_data_ecdf %>% dplyr::filter(ratio > 1, is.finite(ratio))
+
+  plot_data_final <- dplyr::bind_rows(wins, others) %>%
+    dplyr::arrange(!!method_col_sym, ratio)
+
+  # --- 4. Create Summary Dataframe for Caption ---
+  # a) Total and solvable problems for each method
+  total_counts <- plot_data_ecdf %>%
+    dplyr::group_by(!!method_col_sym) %>%
+    dplyr::summarise(n_total = dplyr::n(), .groups = "drop")
+
+  solvable_counts <- df %>%
+    dplyr::filter(!!success_col_sym == TRUE) %>%
+    dplyr::count(!!method_col_sym, name = "n_solvable")
+
+  # b) Win rate (proportion of times a method was the fastest)
+  win_summary <- wins %>%
+    dplyr::select(!!method_col_sym, win_rate = proportion) %>%
+    dplyr::mutate(win_rate = win_rate * 100) # Convert to percentage
+
+  # c) Tau at 90% of solvable problems
+  tau_90 <- plot_data_ecdf %>%
+    dplyr::left_join(solvable_counts, by = rlang::as_name(method_col_sym)) %>%
+    dplyr::filter(!is.na(n_solvable), n_solvable > 0) %>%
+    dplyr::mutate(proportion_of_solvable = (dplyr::row_number() / n_solvable)) %>%
+    dplyr::filter(proportion_of_solvable >= 0.9) %>%
+    dplyr::group_by(!!method_col_sym) %>%
+    dplyr::summarise(tau_at_90_percent = min(ratio), .groups = "drop")
+
+  # d) Median and Mean Tau for successful runs
+  tau_stats <- plot_data %>%
+    dplyr::filter(is.finite(ratio)) %>% # Only for successful runs
+    dplyr::group_by(!!method_col_sym) %>%
+    dplyr::summarise(
+      median_tau = median(ratio, na.rm = TRUE),
+      mean_tau = mean(ratio, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  # e) Combine all summary metrics into a single dataframe
+  all_methods <- df %>% dplyr::distinct(!!method_col_sym)
+
+  caption_data <- all_methods %>%
+    dplyr::left_join(total_counts, by = rlang::as_name(method_col_sym)) %>%
+    dplyr::left_join(solvable_counts, by = rlang::as_name(method_col_sym)) %>%
+    dplyr::left_join(win_summary, by = rlang::as_name(method_col_sym)) %>%
+    dplyr::left_join(tau_90, by = rlang::as_name(method_col_sym)) %>%
+    dplyr::left_join(tau_stats, by = rlang::as_name(method_col_sym)) %>%
+    dplyr::mutate(win_rate = tidyr::replace_na(win_rate, 0)) # Clean up NAs for methods that never won
+
+  # --- 5. Create Plot ---
+  p <- ggplot(plot_data_final, aes(x = ratio, y = proportion, color = !!method_col_sym)) +
+    geom_step(linewidth = 1.5, na.rm = TRUE) +
+    ## Add a distinct point at ratio=1 to highlight the win rate.
+    geom_point(data = wins, aes(x = 1), size = 4, shape = 21, fill = "white", stroke = 1.5) +
+    labs(title = title, y = "Proportion of Problems Solved", color = "Method") +
+    scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0.01, 0.01)))
+  # Apply scaling to the x-axis based on user preference.
+  if (log_scale) {
+    if (is.null(x_limit)) x_limit <- 8
+    p <- p +
+      scale_x_continuous(trans = "log2", breaks = c(1, 2, 4, 8, 16, 32, 64), expand = expansion(mult = c(0.01, 0.01))) +
+      coord_cartesian(xlim = c(1, x_limit), ylim = c(0, 1.01)) +
+      labs(x = bquote(paste("Performance Ratio (", tau, " = ", .(metric_name), " / Best ", .(metric_name), ", ", log[2], " scale)")))
+  } else {
+    if (is.null(x_limit)) x_limit <- 25
+    p <- p +
+      scale_x_continuous(breaks = seq(0, x_limit, by = 5), expand = expansion(mult = c(0.01, 0.01))) +
+      coord_cartesian(xlim = c(1, x_limit), ylim = c(0, 1.01)) +
+      labs(x = paste0("Performance Ratio (τ = ", metric_name, " / Best ", metric_name, ")"))
+  }
+
+  p <- p + theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+      axis.title.x = element_text(face = "bold", margin = margin(t = 10)),
+      axis.title.y = element_text(face = "bold", margin = margin(r = 10)),
+      legend.position = "inside",
+      legend.position.inside = c(0.8, 0.4),
+      panel.grid.major = element_line(color = "gray90", linetype = "dotted"),
+      panel.grid.minor = element_line(color = "gray95", linetype = "dotted")
+    )
+
+  return(list(plot = p, caption_data = caption_data))
+}
+#+end_src
+
+** Single run plot aids
+For working with the single run data.
+#+begin_src bash :eval never
+python -m rgpycrumbs.eon.gprd.log_csv --input-file ec_gprd_d
+oublet_110_d1923ac0-5a99-47d8-9445-9727e736cff5.log.gz --traj-file outer_only.traj --system-id 'd_110' --method "OTGPD"
+#+end_src
+
+Need a new reader too.
+
+#+begin_src R :results none
+load_system_data <- function(system_ids, path = ".") {
+  # Create a regex pattern that matches any of the provided system_ids
+  pattern <- paste0("^(", paste(system_ids, collapse = "|"), ").*\\.csv$")
+
+  files <- list.files(
+    path = path,
+    pattern = pattern,
+    full.names = TRUE
+  )
+
+  if (length(files) == 0) {
+    stop("No CSV files found for the provided system_ids in path '", path, "'")
+  }
+
+  print(paste("Found", length(files), "files for systems:", paste(system_ids, collapse = ", ")))
+
+  # Read and combine all found files into a single tibble
+  map_dfr(files, read_csv, show_col_types = FALSE) %>%
+    mutate(
+      method = as.factor(method),
+      system_id = as.factor(system_id)
+    )
+}
+#+end_src
+
+#+begin_src R :results none
+plot_convergence_srun <- function(data) {
+  data %>%
+    distinct(method, outer_iteration, .keep_all = TRUE) %>%
+    ggplot(aes(x = outer_iteration, y = current_max)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 3) +
+    scale_y_log10(labels = scales::label_number(accuracy = 0.1)) +
+    labs(
+      title = "Convergence Behavior",
+      x = "Outer Relaxation Iteration",
+      y = "Current Max (log scale)"
+    ) +
+    theme_Publication(base_size=14)
+}
+#+end_src
+
+#+begin_src R :results none
+plot_performance_srun <- function(data) {
+  performance_data <- data %>%
+    distinct(method, outer_iteration, .keep_all = TRUE) %>%
+    select(method, outer_iteration, optimize_time, func_count) %>%
+    drop_na()
+
+  # Check number of methods to decide plot type
+  if (n_distinct(performance_data$method) > 1) {
+    # FACETED PLOT for multiple methods (cleaner for comparison)
+    performance_data_long <- performance_data %>%
+      pivot_longer(
+        cols = c(optimize_time, func_count),
+        names_to = "metric",
+        values_to = "value"
+      )
+
+    facet_labels <- c(
+      `func_count` = "Function Counts",
+      `optimize_time` = "Optimize Time (s)"
+    )
+
+    ggplot(performance_data_long, aes(x = outer_iteration, y = value, color = method)) +
+      geom_line(linewidth = 1) +
+      geom_point(size = 3) +
+      facet_wrap(~metric, scales = "free_y", ncol = 1, labeller = as_labeller(facet_labels)) +
+      scale_color_vibrant() +
+      labs(
+        title = "Optimization Performance",
+        x = "Outer Relaxation Iteration",
+        y = NULL,
+        color = "Method"
+      ) +
+      theme_Publication(base_size = 14)
+  } else {
+    # DUAL-AXIS PLOT for a single method
+    scaling_factor <- max(performance_data$optimize_time, na.rm = TRUE) / max(performance_data$func_count, na.rm = TRUE)
+    ggplot(performance_data, aes(x = outer_iteration)) +
+      geom_line(aes(y = optimize_time, color = "Optimize Time (s)"), linetype = "solid", linewidth = 1) +
+      geom_point(aes(y = optimize_time, color = "Optimize Time (s)"), size = 3) +
+      geom_line(aes(y = func_count * scaling_factor, color = "Function Counts"), linetype = "dashed", linewidth = 1) +
+      geom_point(aes(y = func_count * scaling_factor, color = "Function Counts"), shape = 4, size = 3, stroke = 1.5) +
+      scale_y_continuous(
+        name = "Optimize Time (s)",
+        sec.axis = sec_axis(~ . / scaling_factor, name = "Function Counts")
+      ) +
+      scale_color_manual(
+        name = "Metric",
+        values = c("Optimize Time (s)" = "#EE7733", "Function Counts" = "#0077BB") # orange, blue
+      ) +
+      labs(
+        title = "Optimization Performance per Iteration",
+        x = "Outer Relaxation Iteration"
+      ) +
+      theme_Publication(base_size = 14)
+  }
+}
+#+end_src
+
+#+begin_src R :results none
+plot_hyperparameters_srun <- function(data) {
+  hyperparam_data <- data %>%
+    distinct(method, outer_iteration, .keep_all = TRUE) %>%
+    select(method, outer_iteration, magsigma2, contains("-")) %>%
+    pivot_longer(
+      cols = -c(method, outer_iteration),
+      names_to = "hyperparameter",
+      values_to = "value"
+    ) %>%
+    drop_na(value) %>%
+    # Clean up labels for the legend
+    mutate(
+      hyperparameter = str_replace(hyperparameter, "ls_", ""),
+      hyperparameter = str_replace(hyperparameter, "magsigma2", "Var") ## Variance (σ²)
+    )
+
+  ggplot(hyperparam_data, aes(x = outer_iteration, y = value, color = hyperparameter, group = hyperparameter)) +
+    geom_line(linewidth = 1, linetype = "dashed") +
+    geom_point(size = 3) +
+    scale_color_vibrant() +
+    labs(
+      title = "Hyperparameter Evolution",
+      x = "Outer Relaxation Iteration",
+      y = NULL,
+      color = "Hyperparameter"
+    ) +
+    theme_Publication(base_size=14) +
+    theme(legend.position = "top")
+}
+#+end_src
+
+#+begin_src R :results none
+plot_distance_metric_srun <- function(data) {
+  metric_data <- data %>%
+    filter(!is.na(dist_from_known))
+
+  if (nrow(metric_data) == 0) {
+    return(ggplot() +
+      labs(title = "No Distance Metric Data Found"))
+  }
+
+  ggplot(metric_data, aes(x = outer_iteration)) +
+    geom_line(aes(y = threshold), linetype = "dashed", color = "grey50") +
+    geom_jitter(
+      data = . %>% filter(!stopped_early),
+      aes(y = dist_from_known, color = "Converged"),
+      width = 0.2, alpha = 0.7, size = 2.5
+    ) +
+    geom_point(
+      data = . %>% filter(stopped_early),
+      aes(y = dist_from_known, color = "Stopped Early"),
+      shape = 8, size = 4, stroke = 1.5
+    ) +
+    scale_color_manual(
+      name = "Event Type",
+      values = c("Converged" = "#0077BB", "Stopped Early" = "#CC3311")
+    ) +
+    labs(
+      title = "Distance Metric Evolution",
+      x = "Outer Relaxation Iteration",
+      y = "Distance Metric Value"
+    ) +
+    theme_Publication(base_size=14)
+}
+#+end_src
+
+** Results
+*** Fragment analysis
+#+begin_src R :results value :colnames yes :post round-tbl[:colnames yes](*this*)
+dfff %>%
+  # 1. Group the data by both grouping variables
+  group_by(num_fragments, method) %>%
+  # 2. Calculate the summary statistics for each group
+  summarize(
+    # Count the number of TRUE values in the success column
+    # TRUE values are treated as 1, FALSE as 0, so sum() gives the count.
+    success_count = sum(success, na.rm = TRUE),
+
+    # Count the total number of rows (runs) in the group
+    total_runs = n(),
+
+    # Calculate the success rate (or proportion)
+    success_rate = success_count / total_runs,
+
+    # Count the number of failures (optional)
+    failure_count = sum(!success, na.rm = TRUE),
+
+    # To drop the grouping structure afterwards
+    .groups = "drop"
+  ) -> dfff_frags
+dfff_frags
+#+end_src
+
+#+RESULTS[6bcc9c442548e29c4e50418326ddc802fd45dd69]:
+| num_fragments | method  | success_count | total_runs | success_rate | failure_count |
+|---------------+---------+---------------+------------+--------------+---------------|
+|             1 | Dimer   |            24 |         26 |          0.9 |             2 |
+|             1 | GPDimer |            26 |         26 |            1 |             0 |
+|             1 | OTGPD   |            26 |         26 |            1 |             0 |
+|             2 | Dimer   |           205 |        212 |          1.0 |             7 |
+|             2 | GPDimer |           204 |        212 |          1.0 |             8 |
+|             2 | OTGPD   |           207 |        212 |          1.0 |             5 |
+|             3 | Dimer   |           174 |        178 |          1.0 |             4 |
+|             3 | GPDimer |           172 |        178 |          1.0 |             6 |
+|             3 | OTGPD   |           166 |        178 |          0.9 |            12 |
+|             4 | Dimer   |            56 |         57 |          1.0 |             1 |
+|             4 | GPDimer |            55 |         57 |          1.0 |             2 |
+|             4 | OTGPD   |            49 |         57 |          0.9 |             8 |
+|             5 | Dimer   |            19 |         20 |          0.9 |             1 |
+|             5 | GPDimer |            17 |         20 |          0.8 |             3 |
+|             5 | OTGPD   |            19 |         20 |          0.9 |             1 |
+|             6 | Dimer   |             2 |          3 |          0.7 |             1 |
+|             6 | GPDimer |             2 |          3 |          0.7 |             1 |
+|             6 | OTGPD   |             1 |          3 |          0.3 |             2 |
+|             7 | Dimer   |             4 |          4 |            1 |             0 |
+|             7 | GPDimer |             4 |          4 |            1 |             0 |
+|             7 | OTGPD   |             1 |          4 |          0.2 |             3 |
+
+
+# together with the success rate
+Better visualized
+# file link :file ../method_success_plot.png
+#+begin_src R :results  none
+## agg_png("method_success_plot.png", width = 10, height = 8, units = "in", res = 300)
+dfff %>%
+  ## filter(num_fragments < 6) %>%
+  mutate(
+    success_status = factor(success, labels = c("Failure", "Success")),
+    num_fragments_f = factor(num_fragments)
+  ) %>%
+
+  ggplot(aes(x = method, fill = success_status)) +
+
+  # 1. Use position = "fill" to make all bars 100% tall (proportional)
+  geom_bar(position = "fill", color = "black") +
+
+  # 2. Add proportional labels inside the bars
+  geom_text(
+    stat = 'count',
+    # Calculate the proportion for the label placement
+    aes(label = after_stat(count), y = after_stat(count / tapply(count, x, sum)[as.character(x)])),
+    position = position_fill(vjust = 0.5), # Center the labels vertically within the stack
+    size = 11
+    color = "white"
+  ) +
+
+  # 3. Facet by num_fragments
+  facet_wrap(
+    ~ num_fragments_f,
+    ncol = 6,
+    labeller = labeller(num_fragments_f = function(x) paste("Fragments =", x))
+  ) +
+
+  # 4. Set scales and labels
+  scale_y_continuous(labels = scales::percent, name = "Proportion of Runs") +
+  scale_fill_manual(
+    values = c("Failure" = "#E377C2", "Success" = "#1F77B4")
+  ) +
+  labs(
+    title = expression("Method Success Proportion by Fragment Count"),
+    x = "Method",
+    fill = "Run Status"
+  ) +
+
+  # 5. Theme cleanup for a sleek look
+  theme_Publication() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.spacing = unit(0.5, "lines")
+  )
+## dev.off()
+#+end_src
+
+*** GP Acceleration Efficiency
+#+begin_src R :results none
+plot_data_prep <- dfff %>%
+  filter(success == TRUE) %>%
+  filter(method %in% c("Dimer", "GPDimer", "OTGPD")) %>%
+  select(system_id, method, pes_calls, tot_time) %>%
+  pivot_longer(
+    cols = c(tot_time, pes_calls),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    method = factor(method, levels = c("Dimer", "GPDimer", "OTGPD")),
+    metric = factor(metric,
+                    levels = c("pes_calls", "tot_time"),
+                    labels = c("PES Calls", "Total Time"))
+  )
+p_ridge_multi <- ggplot(plot_data_prep, aes(x = value, y = method, fill = method)) +
+  geom_density_ridges(
+    alpha = 0.6,
+ # Increase scale for better overlap if needed, or decrease to separate
+    rel_min_height = 0.01
+  ) +
+
+  # Apply a log scale to the x-axis, as both metrics are highly skewed
+  scale_x_log10(labels = scales::comma) +
+
+  # Apply the custom theme and colors
+  theme_Publication() +
+  scale_fill_Publication() +
+
+  labs(
+    title = "Distribution of Efficiency Metrics",
+    x = "Value (Log Scale)",
+    ## x = "Value",
+    y = "Method"
+  ) +
+
+  ## # Facet the plot by metric
+  facet_wrap(~metric, scales = "free_x") +
+
+  # Custom theme adjustments for the ridges
+  theme(
+    legend.position = "none",
+    panel.grid.major.y = element_blank(),
+    strip.text = element_text(size = rel(1.5))
+  )
+#+end_src
+
+Or with quantiles:
+
+#+begin_src R :results none
+p_ridge_enhanced <- ggplot(plot_data_prep, aes(x = value, y = method, fill = method)) +
+  geom_density_ridges(
+    quantile_lines = TRUE,  # <-- This was the missing, crucial argument.
+    quantiles = c(0.25, 0.5, 0.75),
+    alpha = 0.7,
+    scale = 1.8,
+    rel_min_height = 0.01,
+    vline_color = "black", # Making lines black to stand out
+    vline_linetype = "dashed"
+  ) +
+
+  # Keep the log scale and tick annotations for accuracy and clarity
+  annotation_logticks(sides = "b") +
+  ## scale_x_log10(labels = scales::comma) +
+
+  # Apply the custom theme and colors
+  theme_Publication() +
+  scale_fill_Publication() +
+
+  labs(
+    title = "Distribution of Efficiency Metrics with Quantiles",
+    subtitle = "Dashed lines show the 25th, 50th (median), and 75th percentiles",
+    ## x = "Value (Log Scale)",
+    ## y = "Method"
+  ) +
+  facet_wrap(~metric, scales = "free_x") +
+  theme(
+    legend.position = "none",
+    panel.grid.major.y = element_blank(),
+    strip.text = element_text(size = rel(1.5))
+  )
+
+print(p_ridge_enhanced)
+#+end_src
+
+Or even maybe violins..?
+
+#+begin_src R :results none
+plot_data_base <- dfff %>%
+  filter(success == TRUE, method %in% c("Dimer", "GPDimer", "OTGPD")) %>%
+  mutate(
+    method = factor(method, levels = c("Dimer", "GPDimer", "OTGPD"))
+  )
+
+# Data for the PES Calls plot
+data_pes <- plot_data_base %>% select(method, pes_calls)
+
+# Data for the Total Time plot
+data_time <- plot_data_base %>% select(method, tot_time)
+
+# --- 3. Create Plot 1: PES Calls (Ridgeline) ---
+p_pes <- ggplot(data_pes, aes(x = pes_calls, y = method, fill = method)) +
+  geom_density_ridges(
+    alpha = 0.8,
+    jittered_points = TRUE,
+    point_shape = 19,
+    point_size = 1.5,
+    point_alpha = 0.2,
+    position = position_points_jitter(height = 0),
+    scale = 0.9
+  ) +
+  scale_x_log10(labels = scales::comma) +
+  theme_Publication(base_size = 16) +
+  scale_fill_Publication() +
+  labs(x = "PES Calls (log10)", y = "Method") +
+  theme(legend.position = "none")
+
+# --- 4. Create Plot 2: Total Time (Raincloud) ---
+p_time <- ggplot(data_time, aes(x = tot_time, y = method, fill = method)) +
+  geom_jitter(height = 0.1, alpha = 0.3, size = 1.5, show.legend = FALSE) +
+  geom_violin(alpha = 0.8, trim = TRUE, side = "r", show.legend = FALSE, color = NA) +
+  geom_boxplot(width = 0.15, alpha = 0.8, show.legend = FALSE, outlier.shape = NA) +
+  theme_Publication(base_size = 16) +
+  scale_fill_Publication() +
+  labs(x = "Total Time (minutes)", y = NULL) +
+  theme(
+    legend.position = "none",
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+# --- 5. Combine Plots with Patchwork ---
+p_pes + p_time +
+  plot_annotation(
+    theme = theme(plot.title = element_blank())
+  )
+## Flooring to the OTGPD
+## data_time %>% group_by(method) %>% summarise(n=n())
+#+end_src
+
+*** Comparing GP acceleration methods
+
+#+begin_src R :results none
+df <- bind_rows(data_gprd, data_otgp)
+#+end_src
+
+**** Basic statistics
+
+#+begin_src R :results value :colnames yes :post round-tbl[:colnames yes](*this*)
+df %>% filter(success == TRUE) %>%
+  group_by(method) %>%
+  summarise(median_pes=median(pes_calls),
+            mean_pes=mean(pes_calls),
+            min_pes=min(pes_calls),
+            max_pes=max(pes_calls),
+            n=n())
+#+end_src
+
+#+RESULTS[62b931bf4ffc25c91e5491775455590525f30320]:
+| method | median_pes | mean_pes | min_pes | max_pes |  n |
+|--------+------------+----------+---------+---------+----|
+| GPDimer   |       30.5 |     32.6 |      20 |      82 | 26 |
+| otgp   |         28 |     28.7 |      20 |      45 | 26 |
+
+
+Along with the total time statistic.
+
+#+begin_src R :results value :colnames yes :post round-tbl[:colnames yes](*this*)
+df %>% filter(success == TRUE) %>%
+  group_by(method) %>%
+  summarise(median_time=median(tot_time),
+            mean_time=mean(tot_time),
+            min_time=min(tot_time),
+            max_time=max(tot_time),
+            n=n())
+#+end_src
+
+#+RESULTS[40154440a245b35cad298405beb06861201cb357]:
+| method | median_time | mean_time | min_time | max_time |  n |
+|--------+-------------+-----------+----------+----------+----|
+| GPDimer   |        10.0 |      25.4 |      2.4 |    347.7 | 26 |
+| otgp   |         7.4 |       9.7 |      1.3 |     39.0 | 26 |
+
+
+Now we can check what happens to the ones which reach the same endpoints..
+
+#+begin_src R :results value :colnames yes :post round-tbl[:colnames yes](*this*)
+find_matching_saddles(df,
+                      'method',
+                      'otgp',
+                      'GPDimer',
+                      0.01) -> same_saddles_rot
+same_saddles_rot %>%
+  group_by(method) %>%
+  summarize(mpes=mean(pes_calls), mtime = mean(tot_time), n=n())
+#+end_src
+
+#+RESULTS[9a759e3aa2b513686254b170793288f7ff990cbd]:
+| method | mpes | mtime |  n |
+|--------+------+-------+----|
+| GPDimer   | 27.6 |  12.6 | 19 |
+| otgp   | 26.8 |   9.9 | 19 |
+
+
+Finally we close the visualizations out with some actual visuals.
+
+#+begin_src R :results none
+plot_diff_in(df %>% filter(pes_calls < 1500),
+             'pes_calls', 'method',
+             'GPDimer', 'otgp', 'PES calls', 0.01,
+             ## point_color = color("muted", reverse=TRUE)(3),
+             ) -> pdiff_idr
+plot_linecomp(df, 'pes_calls', 'method', 'otgp', 'GPDimer', 'PES Calls', 0.01) -> plc_pes_idr
+plot_linecomp(df, 'tot_time', 'method', 'otgp', 'GPDimer', 'Total time', 0.01) -> plc_time_idr
+## Maybe because plot_diff_in doesn't keep the ones which are equal
+pdiff_idr + theme_Publication() | (plc_pes_idr / plc_time_idr)
+#+end_src
+
+*** Identifying common failures
+**** GPDimer and OTGPD
+#+begin_src R :results value :colnames yes :post round-tbl[:colnames yes](*this*)
+# Find system_ids where GPDimer failed
+gpd_failures <- dfff %>%
+  filter(method == "GPDimer", success == FALSE) %>%
+  pull(system_id) %>%
+  unique()
+
+# Find system_ids where OTGPD succeeded
+otgpd_successes <- dfff %>%
+  filter(method == "OTGPD", success == TRUE) %>%
+  pull(system_id) %>%
+  unique()
+
+# Filter the original dataframe for systems that are in both lists
+dfff %>%
+  filter(system_id %in% gpd_failures & system_id %in% otgpd_successes) %>%
+  select(system_id, method, success, saddle_energy, saddle_fmax)
+#+end_src
+
+#+RESULTS[54c172cf8b9617f1f664e9061afd308ccae20517]:
+| system_id | method  | success | saddle_energy | saddle_fmax |
+|-----------+---------+---------+---------------+-------------|
+| d_006     | Dimer   | TRUE    |       -7199.7 |         0.0 |
+| d_052     | Dimer   | TRUE    |      -10398.2 |         0.0 |
+| d_075     | Dimer   | TRUE    |       -7319.7 |         0.0 |
+| d_087     | Dimer   | FALSE   |               |             |
+| d_104     | Dimer   | FALSE   |               |             |
+| d_110     | Dimer   | TRUE    |       -6317.3 |         0.0 |
+| d_150     | Dimer   | TRUE    |      -10398.7 |         0.0 |
+| d_160     | Dimer   | TRUE    |       -9313.1 |         0.0 |
+| d_193     | Dimer   | TRUE    |       -7405.1 |         0.0 |
+| d_199     | Dimer   | TRUE    |       -8461.2 |         0.0 |
+| s_065     | Dimer   | TRUE    |       -4219.9 |         0.0 |
+| s_074     | Dimer   | TRUE    |       -5276.1 |         0.0 |
+| s_082     | Dimer   | TRUE    |       -8389.8 |         0.0 |
+| s_137     | Dimer   | TRUE    |       -4220.4 |         0.0 |
+| s_207     | Dimer   | TRUE    |       -7334.0 |         0.0 |
+| s_256     | Dimer   | TRUE    |       -6331.2 |         0.0 |
+| d_006     | GPDimer | FALSE   |               |             |
+| d_052     | GPDimer | FALSE   |               |             |
+| d_075     | GPDimer | FALSE   |               |             |
+| d_087     | GPDimer | FALSE   |               |             |
+| d_104     | GPDimer | FALSE   |               |             |
+| d_110     | GPDimer | FALSE   |               |             |
+| d_150     | GPDimer | FALSE   |               |             |
+| d_160     | GPDimer | FALSE   |               |             |
+| d_193     | GPDimer | FALSE   |               |             |
+| d_199     | GPDimer | FALSE   |               |             |
+| s_065     | GPDimer | FALSE   |               |             |
+| s_074     | GPDimer | FALSE   |               |             |
+| s_082     | GPDimer | FALSE   |               |             |
+| s_137     | GPDimer | FALSE   |               |             |
+| s_207     | GPDimer | FALSE   |               |             |
+| s_256     | GPDimer | FALSE   |               |             |
+| d_006     | OTGPD   | TRUE    |       -7199.7 |         0.0 |
+| d_052     | OTGPD   | TRUE    |      -10398.2 |         0.0 |
+| d_075     | OTGPD   | TRUE    |       -7319.7 |         0.0 |
+| d_087     | OTGPD   | TRUE    |       -9341.9 |         0.0 |
+| d_104     | OTGPD   | TRUE    |       -7317.2 |         0.0 |
+| d_110     | OTGPD   | TRUE    |       -6317.3 |         0.0 |
+| d_150     | OTGPD   | TRUE    |      -10398.7 |         0.0 |
+| d_160     | OTGPD   | TRUE    |       -9313.1 |         0.0 |
+| d_193     | OTGPD   | TRUE    |       -7405.1 |         0.0 |
+| d_199     | OTGPD   | TRUE    |       -8461.2 |         0.0 |
+| s_065     | OTGPD   | TRUE    |       -4219.9 |         0.0 |
+| s_074     | OTGPD   | TRUE    |       -5275.8 |         0.0 |
+| s_082     | OTGPD   | TRUE    |       -8389.8 |         0.0 |
+| s_137     | OTGPD   | TRUE    |       -4220.4 |         0.0 |
+| s_207     | OTGPD   | TRUE    |       -7334.0 |         0.0 |
+| s_256     | OTGPD   | TRUE    |       -6330.7 |         0.0 |
+
+**** Only OTGPD suceeds
+#+begin_src R :results value :colnames yes :post round-tbl[:colnames yes](*this*)
+# Find system_ids where GPDimer failed
+gpd_failures <- dfff %>%
+  filter(method == "GPDimer", success == FALSE) %>%
+  pull(system_id) %>%
+  unique()
+
+# Find system_ids where OTGPD succeeded
+otgpd_successes <- dfff %>%
+  filter(method == "OTGPD", success == TRUE) %>%
+  pull(system_id) %>%
+  unique()
+
+# Filter the original dataframe for systems that are in both lists
+dfff %>%
+  filter(system_id %in% gpd_failures & system_id %in% otgpd_successes) %>%
+  select(system_id, method, success, saddle_energy, saddle_fmax)
+#+end_src
+
+#+RESULTS[54c172cf8b9617f1f664e9061afd308ccae20517]:
+| system_id | method  | success | saddle_energy | saddle_fmax |
+|-----------+---------+---------+---------------+-------------|
+| d_006     | Dimer   | TRUE    |       -7199.7 |         0.0 |
+| d_052     | Dimer   | TRUE    |      -10398.2 |         0.0 |
+| d_075     | Dimer   | TRUE    |       -7319.7 |         0.0 |
+| d_087     | Dimer   | FALSE   |               |             |
+| d_104     | Dimer   | FALSE   |               |             |
+| d_110     | Dimer   | TRUE    |       -6317.3 |         0.0 |
+| d_150     | Dimer   | TRUE    |      -10398.7 |         0.0 |
+| d_160     | Dimer   | TRUE    |       -9313.1 |         0.0 |
+| d_193     | Dimer   | TRUE    |       -7405.1 |         0.0 |
+| d_199     | Dimer   | TRUE    |       -8461.2 |         0.0 |
+| s_065     | Dimer   | TRUE    |       -4219.9 |         0.0 |
+| s_074     | Dimer   | TRUE    |       -5276.1 |         0.0 |
+| s_082     | Dimer   | TRUE    |       -8389.8 |         0.0 |
+| s_137     | Dimer   | TRUE    |       -4220.4 |         0.0 |
+| s_207     | Dimer   | TRUE    |       -7334.0 |         0.0 |
+| s_256     | Dimer   | TRUE    |       -6331.2 |         0.0 |
+| d_006     | GPDimer | FALSE   |               |             |
+| d_052     | GPDimer | FALSE   |               |             |
+| d_075     | GPDimer | FALSE   |               |             |
+| d_087     | GPDimer | FALSE   |               |             |
+| d_104     | GPDimer | FALSE   |               |             |
+| d_110     | GPDimer | FALSE   |               |             |
+| d_150     | GPDimer | FALSE   |               |             |
+| d_160     | GPDimer | FALSE   |               |             |
+| d_193     | GPDimer | FALSE   |               |             |
+| d_199     | GPDimer | FALSE   |               |             |
+| s_065     | GPDimer | FALSE   |               |             |
+| s_074     | GPDimer | FALSE   |               |             |
+| s_082     | GPDimer | FALSE   |               |             |
+| s_137     | GPDimer | FALSE   |               |             |
+| s_207     | GPDimer | FALSE   |               |             |
+| s_256     | GPDimer | FALSE   |               |             |
+| d_006     | OTGPD   | TRUE    |       -7199.7 |         0.0 |
+| d_052     | OTGPD   | TRUE    |      -10398.2 |         0.0 |
+| d_075     | OTGPD   | TRUE    |       -7319.7 |         0.0 |
+| d_087     | OTGPD   | TRUE    |       -9341.9 |         0.0 |
+| d_104     | OTGPD   | TRUE    |       -7317.2 |         0.0 |
+| d_110     | OTGPD   | TRUE    |       -6317.3 |         0.0 |
+| d_150     | OTGPD   | TRUE    |      -10398.7 |         0.0 |
+| d_160     | OTGPD   | TRUE    |       -9313.1 |         0.0 |
+| d_193     | OTGPD   | TRUE    |       -7405.1 |         0.0 |
+| d_199     | OTGPD   | TRUE    |       -8461.2 |         0.0 |
+| s_065     | OTGPD   | TRUE    |       -4219.9 |         0.0 |
+| s_074     | OTGPD   | TRUE    |       -5275.8 |         0.0 |
+| s_082     | OTGPD   | TRUE    |       -8389.8 |         0.0 |
+| s_137     | OTGPD   | TRUE    |       -4220.4 |         0.0 |
+| s_207     | OTGPD   | TRUE    |       -7334.0 |         0.0 |
+| s_256     | OTGPD   | TRUE    |       -6330.7 |         0.0 |
+
+*** Temp
+#+begin_src R
+
+## =========================================================================
+## PLOT 1: RAW PERFORMANCE METRICS (TIME AND PES CALLS)
+## =========================================================================
+
+#' Generates a two-panel plot showing the raw distribution of total time and PES calls.
+#'
+#' @param df A data frame containing the performance data.
+#' @return A combined ggplot object.
+generate_raw_performance_plot <- function(df) {
+  # Panel A: Total Wall Time
+  plot_time <- ggplot(df, aes(x = method, y = total_time, fill = method)) +
+    geom_violin(trim = FALSE) +
+    geom_boxplot(width = 0.1, fill = "white") +
+    scale_y_log10(labels = scales::label_number(suffix = "s")) +
+    scale_fill_manual(values = c("Dimer" = "#984ea3", "GPDimer" = "#ff7f00", "OTGPD" = "#4daf4a")) +
+    labs(
+      title = "Total Wall Time",
+      y = "Time (s, Log Scale)",
+      x = NULL
+    ) +
+    theme_bw(base_size = 14) +
+    theme(legend.position = "none")
+
+  # Panel B: PES Calls
+  plot_calls <- ggplot(df, aes(x = method, y = pes_calls, fill = method)) +
+    geom_violin(trim = FALSE) +
+    geom_boxplot(width = 0.1, fill = "white") +
+    scale_y_log10(labels = scales::label_number()) +
+    scale_fill_manual(values = c("Dimer" = "#984ea3", "GPDimer" = "#ff7f00", "OTGPD" = "#4daf4a")) +
+    labs(
+      title = "PES Calls",
+      y = "Number of Calls (Log Scale)",
+      x = NULL
+    ) +
+    theme_bw(base_size = 14) +
+    theme(legend.position = "none")
+
+  # Combine plots
+  combined_plot <- plot_time + plot_calls +
+    plot_annotation(
+      title = "Empirical Performance on the dfff Dataset",
+      subtitle = "Distribution of raw cost metrics for all comparable systems"
+    ) &
+    theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+  return(combined_plot)
+}
+
+
+## =========================================================================
+## PLOT 2: EMPIRICAL EFFICIENCY VS. INTRINSIC COMPLEXITY
+## =========================================================================
+
+#' Generates a plot of empirical efficiency vs. intrinsic problem complexity.
+#'
+#' @param df A data frame that has already been processed to include 'pes'
+#'   and the complexity bin labels ('barrier_bin', 'n_best_bin').
+#' @return A ggplot object.
+generate_empirical_efficiency_plot <- function(df) {
+  plot_empirical <- ggplot(df, aes(x = n_best_bin, y = pes, fill = method)) +
+    geom_boxplot() +
+    facet_grid(barrier_bin ~ method) +
+    # The score is a ratio, so we format it as a percentage
+    scale_y_continuous(labels = scales::percent) +
+    scale_fill_manual(values = c("Dimer" = "#984ea3", "GPDimer" = "#ff7f00", "OTGPD" = "#4daf4a")) +
+    labs(
+      title = "Empirical Efficiency vs. Intrinsic Problem Complexity",
+      subtitle = "Efficiency distributions across energetic and algorithmic difficulty regimes",
+      x = "Algorithmic Difficulty (N_best)",
+      y = "Practical Efficiency Score"
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5),
+      legend.position = "none",
+      strip.text = element_text(face = "bold", size = 12),
+      axis.text.x = element_text(angle = 25, hjust = 1) # Angle labels for readability
+    )
+
+  return(plot_empirical)
+}
+
+
+## =========================================================================
+## PLOT 3: PREDICTIVE EFFICIENCY MODEL
+## =========================================================================
+
+#' Generates a predictive plot of the Practical Efficiency Score (PES).
+#' @param df A data frame with pre-calculated 'overhead_time'.
+#' @param boot_reps The number of bootstrap replicates for confidence intervals.
+#' @return A ggplot object.
+generate_predictive_efficiency_plot <- function(df, boot_reps = 100) {
+  baselines <- df %>%
+    group_by(system) %>%
+    summarise(
+      n_best_for_system = min(pes_calls, na.rm = TRUE),
+      t_overhead_min_for_system = min(overhead_time, na.rm = TRUE),
+      .groups = 'drop'
+    )
+
+  t_dft_range <- 10^seq(-2, 3, length.out = 50)
+
+  # Bootstrap process
+  boot_results <- lapply(1:boot_reps, function(i) {
+    # Sample systems with replacement
+    sampled_systems <- sample(unique(df$system), replace = TRUE)
+
+    # Filter original data for these systems and join baselines
+    projected_data <- df %>%
+      filter(system %in% sampled_systems) %>%
+      left_join(baselines, by = "system") %>%
+      crossing(t_dft_hypothetical = t_dft_range) %>%
+      mutate(
+        t_ideal = t_overhead_min_for_system + (n_best_for_system * t_dft_hypothetical),
+        t_actual = overhead_time + (pes_calls * t_dft_hypothetical),
+        pes = t_ideal / t_actual
+      )
+
+    # Summarize this replicate
+    projected_data %>%
+      group_by(method, t_dft_hypothetical) %>%
+      summarise(mean_pes = mean(pes, na.rm = TRUE), .groups = 'drop') %>%
+      mutate(replicate = i)
+  }) %>% bind_rows()
+
+  # Calculate final confidence intervals
+  summary_data <- boot_results %>%
+    group_by(method, t_dft_hypothetical) %>%
+    summarise(
+      mean_pes = mean(mean_pes, na.rm = TRUE),
+      ci_lower = quantile(mean_pes, 0.025, na.rm = TRUE),
+      ci_upper = quantile(mean_pes, 0.975, na.rm = TRUE),
+      .groups = 'drop'
+    )
+
+  # Create the plot
+  pes_plot <- ggplot(summary_data, aes(x = t_dft_hypothetical, y = mean_pes, color = method, fill = method)) +
+    geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.2, linetype = 0) +
+    geom_line(size = 1.5) +
+    scale_x_log10(
+      breaks = 10^(-2:3),
+      labels = scales::trans_format("log10", scales::math_format(10^.x))
+    ) +
+    scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+    scale_color_manual(name = "Method", values = c("Dimer" = "#984ea3", "GPDimer" = "#ff7f00", "OTGPD" = "#4daf4a")) +
+    scale_fill_manual(name = "Method", values = c("Dimer" = "#984ea3", "GPDimer" = "#ff7f00", "OTGPD" = "#4daf4a")) +
+    labs(
+      title = "Practical Efficiency vs. DFT Cost",
+      subtitle = "Shaded areas represent 95% bootstrap confidence intervals",
+      x = expression(paste("Cost per PES Call (", t[DFT], "), seconds")),
+      y = "Practical Efficiency Score"
+    ) +
+    theme_bw(base_size = 16) +
+    theme(
+      plot.title = element_text(face="bold", hjust=0.5),
+      plot.subtitle = element_text(hjust=0.5),
+      legend.position = "bottom",
+      legend.title = element_text(face="bold"),
+      axis.title = element_text(face="bold")
+    )
+
+  return(pes_plot)
+}
+
+
+## =========================================================================
+## DATA PREPARATION AND WORKFLOW
+## =========================================================================
+
+# Ensure your 'dfff' dataset is loaded
+
+# --- 1. Define the Consistent Set of Comparable Systems ---
+comparable_systems <- dfff %>%
+  filter(success == TRUE) %>%
+  group_by(system_id) %>%
+  # Find systems where all 3 methods succeeded
+  filter(n_distinct(method) == 3) %>%
+  ungroup() %>%
+  distinct(system_id) %>%
+  pull(system_id)
+
+# Filter the main dataframe to only these systems
+dfff_comparable <- dfff %>%
+  filter(system_id %in% comparable_systems, success == TRUE) %>%
+  rename(
+    system = system_id,
+    total_time = tot_time,
+    rmsd = rmsd_init_saddle
+  ) %>%
+  mutate(method = as.character(method))
+
+# --- 2. Empirically Estimate t_dft on a PER-SYSTEM basis ---
+t_dft_per_system <- dfff_comparable %>%
+  filter(method == "Dimer") %>%
+  group_by(system) %>%
+  summarise(t_dft_system = mean(total_time / pes_calls, na.rm = TRUE))
+
+# --- 3. Pre-calculate Overhead for the Comparable Set ---
+dfff_processed <- dfff_comparable %>%
+  left_join(t_dft_per_system, by = "system") %>%
+  mutate(
+    overhead_time = total_time - (pes_calls * t_dft_system),
+    # Cap negative overhead at zero to handle estimation artifacts
+    overhead_time = pmax(0, overhead_time)
+  )
+
+# --- 4. Define Complexity Bins and Calculate Empirical Efficiency ---
+
+# First, get the 'best' values (N_best, T_overhead_min) for each system
+system_bests <- dfff_processed %>%
+  group_by(system) %>%
+  summarise(
+    n_best = min(pes_calls, na.rm = TRUE),
+    t_overhead_min = min(overhead_time, na.rm = TRUE)
+  )
+
+# Define Barrier Bins (Median split)
+barrier_median <- median(dfff_processed$barrier, na.rm = TRUE)
+# Define N_best Bins (Tertile split)
+n_best_tertiles <- quantile(system_bests$n_best, probs = c(1/3, 2/3), na.rm = TRUE)
+
+# --- 5. Add Bin Labels and the 'pes' column to the Final Dataframe ---
+
+# *** CHANGE: Create quantitative labels for the N_best bins ***
+n_best_min <- floor(min(system_bests$n_best, na.rm = TRUE))
+n_best_max <- ceiling(max(system_bests$n_best, na.rm = TRUE))
+q1 <- floor(n_best_tertiles[1])
+q2 <- floor(n_best_tertiles[2])
+
+# Create the new labels
+level_low <- paste0("[", n_best_min, " - ", q1, "]")
+level_med <- paste0("(", q1, " - ", q2, "]")
+level_high <- paste0("(", q2, " - ", n_best_max, "]")
+
+dfff_final_for_plotting <- dfff_processed %>%
+  left_join(system_bests, by = "system") %>%
+  mutate(
+    t_ideal_empirical = t_overhead_min + (n_best * t_dft_system),
+    pes = t_ideal_empirical / total_time
+  ) %>%
+  mutate(
+    barrier_bin = factor(ifelse(barrier < barrier_median, "Low Barrier", "High Barrier")),
+    n_best_bin = factor(
+      case_when(
+        n_best <= q1 ~ level_low,
+        n_best <= q2 ~ level_med,
+        TRUE ~ level_high
+      ), levels = c(level_low, level_med, level_high)
+    )
+  )
+
+## =========================================================================
+## EXECUTE PLOTTING FUNCTIONS
+## =========================================================================
+
+# Plot 1: Raw Performance
+print(generate_raw_performance_plot(dfff_final_for_plotting))
+
+# Plot 2: Empirical Efficiency vs. Complexity
+print(generate_empirical_efficiency_plot(dfff_final_for_plotting))
+#+end_src
+
+#+RESULTS[824ddeced1acf0882376cc5009c6f42570a9a354]:
+
+
+#+begin_src R :results drawer replace
+## agg_png("method_success_plot.png", width = 360, height = 240, units = "mm", res = 600)
+plot_df <- dfff %>%
+  filter(num_fragments < 7)
+
+results <- generate_saddle_comparison_plot(
+  df = plot_df,
+  primary_method = "OTGPD",
+  competitor_methods = c("GPDimer", "Dimer"),
+  tolerance = 0.01,
+  value_col = "barrier",
+  system_id_col = "system_id"
+)
+
+results$plot <- results$plot +
+  theme_Publication() +
+  theme(
+    plot.subtitle = element_blank(),
+    plot.title = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.y = element_blank(),
+    legend.direction = "horizontal",
+    legend.position = "top"
+  )
+
+# 3. Print the plot
+if (!is.null(results$plot)) {
+  print(results$plot)
+}
+## dev.off()
+
+# 4. Create a Publication-Ready Table from the Summary Data
+if (nrow(results$summary_df) > 0) {
+  caption_table <- results$summary_df %>%
+    mutate(
+      # Format the value string with count and percentage
+      Value = paste0(n, " (", sprintf("%.1f%%", percentage), ")")
+    ) %>%
+    # Select only the columns needed for the final table
+    select(outcome, comparison_pair, Value) %>%
+    # Pivot to the wide format you need for the caption
+    pivot_wider(names_from = comparison_pair, values_from = Value, values_fill = "0 (0.0%)")
+
+  # Print the resulting table
+  knitr::kable(caption_table, format="org")
+}
+#+end_src
+
+Probably not going to make the cut but:
+
+#+begin_src R :results none
+diverging_plot <- generate_diverging_comparison_plot(
+  summary_df = results$summary_df,
+  primary_method = "OTGPD"
+)
+diverging_plot
+#+end_src
+** Final Figures
+*** I: Success Probability
+Recall that the OTGPD times out after 240 minutes, so anything longer counts as a "failure" for this plot.
+#+begin_src R :results drawer replace
+agg_png("method_success_plot.png", width = 360, height = 240, units = "mm", res = 300)
+plot_df <- dfff %>%
+  filter(num_fragments < 3) %>%
+  mutate(
+    termination_status = if_else(
+      .data[["tot_time"]] > 240,
+      as.factor("Timeout"),
+      .data[["termination_status"]]
+    )
+  ) %>%
+  mutate(
+    !!sym("success") := case_when(
+      # If termination_status is NA, treat as 0 (Failure)
+      is.na(.data[["termination_status"]]) ~ 0,
+      # If status is "GOOD", it's 1 (Success)
+      .data[["termination_status"]] == "GOOD" ~ 1,
+      # All other statuses (e.g., Timeout, Error) are 0 (Failure)
+      TRUE ~ 0
+    )
+  )
+
+# --- Plot 1: OTGPD vs. GPDimer ---
+p1 <- plot_success_comp(
+  df = plot_df,
+  system_id_cols = c("system_id"),
+  comparison_col = "method",
+  level1 = "GPDimer",
+  level2 = "OTGPD",
+  level_names = c("GPDimer", "OTGPD"),
+  success_col = "success",
+  sort_by_col = "rmsd_init_saddle",
+  point_colors = c("orange", "red", "grey50", "blue"),
+  show_summary_text = FALSE
+)
+
+p1$plot <- p1$plot +
+  labs(
+    x = "System Sorted by Mean RMSD", y = NULL, title = NULL
+  ) +
+  theme_Publication() +
+  theme(
+    plot.subtitle = element_blank(),
+    panel.grid.major.y = element_line(color = "grey80", linetype = "dashed"),
+    panel.grid.major.x = element_line(color = "grey80", linetype = "dashed"),
+    legend.position = "none"
+  )
+
+# --- Plot 2: OTGPD vs. Dimer ---
+p2 <- plot_success_comp(
+  df = plot_df,
+  system_id_cols = c("system_id"),
+  comparison_col = "method",
+  level1 = "Dimer",
+  level2 = "OTGPD",
+  level_names = c("Dimer", "OTGPD"),
+  success_col = "success",
+  sort_by_col = "rmsd_init_saddle",
+  point_colors = c("orange", "red", "grey50", "blue"),
+  show_summary_text = FALSE
+)
+p2$plot <- p2$plot +
+  labs(
+    x = "System Sorted by Mean RMSD", y = NULL, title = NULL
+  ) +
+  theme_Publication() +
+  theme(
+    plot.subtitle = element_blank(),
+    panel.grid.major.y = element_line(color = "grey80", linetype = "dashed"),
+    panel.grid.major.x = element_line(color = "grey80", linetype = "dashed"),
+    legend.position = "none"
+  )
+
+p3 <- plot_df %>%
+  mutate(
+    success_status = factor(success, labels = c("Failure", "Success")),
+    num_fragments_f = factor(num_fragments)
+  ) %>%
+  ggplot(aes(x = method, fill = success_status)) +
+
+  # 1. Use position = "fill" to make all bars 100% tall (proportional)
+  geom_bar(position = "fill", color = "black") +
+
+  # 2. Add proportional labels inside the bars
+  geom_text(
+    stat = "count",
+    fontface = "bold",
+    ## Calculate the proportion for the label placement
+    aes(label = after_stat(count), y = after_stat(count / tapply(count, x, sum)[as.character(x)])),
+    ## Center the labels vertically within the stack
+    position = position_fill(vjust = 0.5),
+    color = "white"
+  ) +
+
+  # 3. Facet by num_fragments
+  facet_wrap(
+    ~num_fragments_f,
+    ncol = 6,
+    labeller = labeller(num_fragments_f = function(x) paste("Fragments =", x))
+  ) +
+
+  # 4. Set scales and labels
+  coord_cartesian(ylim = c(0.4, 1.0)) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(
+    values = c("Failure" = "#E377C2", "Success" = "#1F77B4")
+  ) +
+  labs(
+    x = NULL, y = NULL, title = NULL,
+    fill = "Run Status"
+  ) +
+
+  # 5. Theme cleanup for a sleek look
+  theme_Publication() +
+  theme(
+    plot.title = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.title.x = element_blank(),
+    legend.position = "right",
+    panel.spacing = unit(0.5, "lines")
+  )
+
+# --- Combine the plots ---
+(((p1$plot | p2$plot) + plot_layout(axis_titles = "collect")) / p3) + plot_layout(heights = c(0.4, 1)) + plot_annotation(
+  tag_levels = "A"
+)
+dev.off()
+
+## Now the caption
+summary_df1 <- parse_success_comp_summary(p1$summary_text, "OTGPD_v_GPDimer")
+summary_df2 <- parse_success_comp_summary(p2$summary_text, "OTGPD_v_Dimer")
+
+final_table_data <- bind_rows(summary_df1, summary_df2) %>%
+  mutate(
+    Value = paste0(Count, " (", Pct, ")"),
+    Outcome = str_replace(Outcome, " only", " Only Succeeds") %>%
+      str_replace("Succeeded", "Succeed ✔") %>%
+      str_replace("Failed", "Fail ✘")
+  ) %>%
+  select(Outcome, Comparison, Value) %>%
+  pivot_wider(names_from = Comparison, values_from = Value)
+
+total_systems_gprd <- final_table_data %>%
+  # Filter out rows that do not have a standard count (e.g., 'Missing Level' with '0 (NA)')
+  filter(!grepl("NA", `OTGPD_v_GPDimer`)) %>%
+  # Extract the count part of the string (before the first space)
+  mutate(Count = as.numeric(sub("\\s.*", "", `OTGPD_v_GPDimer`))) %>%
+  # Sum the counts
+  summarise(Total = sum(Count, na.rm = TRUE)) %>%
+  pull(Total)
+
+knitr::kable(final_table_data, format = "org", caption = paste(total_systems_gprd, "systems across", plot_df %>% select(num_fragments) %>% max(), "fragments, > 240 minutes is a failure"))
+#+end_src
+
+#+RESULTS[f58bdf29a06b4e7e2072d5bde5def9ff6a9e349d]:
+:results:
+#+CAPTION: 238 systems across 2 fragments, > 240 minutes is a failure
+
+|Outcome               |OTGPD_v_GPDimer |OTGPD_v_Dimer |
+|<l>                   |<l>             |<l>           |
+|----------------------+----------------+--------------|
+|Both Fail ✘           |2 (0.8%)        |1 (0.4%)      |
+|OTGPD Only Succeeds   |11 (4.6%)       |9 (3.8%)      |
+|Both Succeed ✔        |222 (93.3%)     |224 (94.1%)   |
+|GPDimer Only Succeeds |3 (1.3%)        |NA            |
+|Missing Level         |0 (NA)          |0 (NA)        |
+|Dimer Only Succeeds   |NA              |4 (1.7%)      |
+:end:
+
+*** II: Saddle Quality
+
+Together with the equality view:
+
+#+begin_src R :results drawer replace
+agg_png("method_quality_plot.png", width = 360, height = 240, units = "mm", res = 300)
+plot_df <- dfff %>%
+  filter(num_fragments < 3)
+
+results <- generate_saddle_comparison_plot(
+  df = plot_df,
+  primary_method = "OTGPD",
+  competitor_methods = c("GPDimer", "Dimer"),
+  tolerance = 0.01,
+  value_col = "barrier",
+  system_id_col = "system_id"
+)
+
+plot_agreement <- generate_agreement_plot_with_n(results$summary_df) + theme_Publication() +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.title.y = element_blank(),
+  )
+plot_disagreement <- generate_diverging_disagreement_plot(
+  summary_df = results$summary_df,
+  primary_method = "OTGPD",
+) + theme_Publication()
+
+final_plot <- plot_agreement / plot_disagreement +
+  plot_annotation(
+    title = "OTGPD Performance: High Agreement with Dimer and Superiority in Disagreements",
+    tag_levels = "A"
+  ) &
+  theme(
+    plot.title = element_blank(),
+    plot.subtitle = element_blank(),
+    legend.direction = "horizontal",
+    legend.position = "top",
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.title.y = element_blank()
+  )
+
+print(final_plot)
+dev.off()
+
+
+if (nrow(results$summary_df) > 0) {
+  caption_table <- results$summary_df %>%
+    mutate(
+      # Format the value string with count and percentage
+      Value = paste0(n, " (", sprintf("%.1f%%", percentage), ")")
+    ) %>%
+    # Select only the columns needed for the final table
+    select(outcome, comparison_pair, Value) %>%
+    # Pivot to the wide format you need for the caption
+    pivot_wider(names_from = comparison_pair, values_from = Value, values_fill = "0 (0.0%)")
+
+  # Print the resulting table
+  knitr::kable(caption_table, format = "org")
+}
+#+end_src
+
+#+RESULTS[3bc072545ef67d5ad74e42e0a2aaebbb59b88a3b]:
+:results:
+| outcome | OTGPD vs GPDimer | OTGPD vs Dimer |
+| <l>     | <l>              | <l>            |
+|---------+------------------+----------------|
+| Equal   | 171 (75.7%)      | 201 (89.7%)    |
+| GPDimer | 26 (11.5%)       | 0 (0.0%)       |
+| OTGPD   | 29 (12.8%)       | 11 (4.9%)      |
+| Dimer   | 0 (0.0%)         | 12 (5.4%)      |
+:end:
+
+*** III: Performance metrics
+#+begin_src R :results drawer replace
+plot_data <- dfff %>% filter(num_fragments < 3)
+## agg_png("method_performance_plot.png", width = 720, height = 240, units = "mm", res = 300)
+perf_plot <- create_performance_profile(
+  df = plot_data,
+  problem_cols = c("mol_id", "spin"),
+  method_col = method,
+  metric_col = tot_time,
+  success_col = success,
+  log_scale = TRUE,
+  metric_name = "Time",
+  title = "Time Performance Profile"
+)
+
+# The win_rate is a percentage, so divide by 100 to get the proportion
+start_points <- perf_plot$caption_data$win_rate / 100
+
+# Combine 0%, 100%, and the unique, sorted start points for the y-axis
+custom_breaks <- sort(unique(c(0, start_points, 1.0)))
+
+p1 <- perf_plot[[1]] + theme_Publication() +
+  labs(
+    x = expression("Time / Shortest Time" * " (" * log[2] * " scale)"),
+    ## y = expression(P(r[p*","*s] <= tau))
+  ) +
+  scale_y_continuous(
+    labels = scales::number_format(accuracy = 0.01), # 0 to 1 scale
+    breaks = custom_breaks,
+    expand = expansion(mult = c(0.01, 0.01))
+  ) +
+  theme(
+    plot.title = element_blank(),
+    legend.position = "inside",
+    ## offsets are x-,y- from bottom left, 0 to 1
+    axis.title.y = element_text(face = "bold", vjust = -10),
+    legend.position.inside = c(0.8, 0.2),
+    panel.spacing = unit(0.5, "lines")
+  ) + scale_color_Publication()
+
+
+# Data for the PES Calls plot
+data_pes <- plot_data %>%
+  filter(success == TRUE) %>%
+  select(method, pes_calls)
+
+p_pes_clean <- ggplot(data_pes, aes(x = pes_calls, y = method, fill = method)) +
+  geom_violin(
+    alpha = 0.6,
+    trim = TRUE,
+    show.legend = FALSE,
+    color = NA
+  ) +
+  ## geom_density_ridges()+
+  geom_boxplot(
+    width = 0.15,
+    alpha = 0.9,
+    show.legend = FALSE,
+    color = "black" # Use black border for clean separation
+  ) +
+  geom_point(
+    position = position_jitter(height = 0.1, width = 0),
+    size = 1.5,
+    alpha = 0.1, # Keep them very light to not overpower the violin/box
+    show.legend = FALSE
+  ) +
+
+  # Log10 scale for X-axis (PES Calls)
+  scale_x_log10() +
+
+  # Apply theme and colors
+  theme_Publication() +
+  scale_fill_Publication() +
+
+  # Clean, academic labels
+  labs(
+    x = expression("HF Calcs. (" * log[10] * " scale)"),
+    y = NULL
+  ) +
+  theme(
+    legend.position = "none",
+    plot.title = element_blank(),
+    axis.title.x = element_text(face = "bold", margin = margin(t = 10)),
+    axis.text.y = element_text(face = "bold"),
+  )
+
+
+pall <- (p1 / p_pes_clean) + plot_layout(heights = c(2, 1)) + plot_annotation(tag_levels = "A")
+## ggsave("full_datperf.png", pall, width = 47.4, height = 20, units="cm")
+ggsave("full_datperf.png", pall, width = 20, height = 10)
+## dev.off
+formatted_table <- perf_plot$caption_data %>%
+  # Arrange by a key performance metric, like win_rate, for a logical order
+  arrange(desc(win_rate)) %>%
+  # Select the most important columns and give them publication-ready names
+  transmute(
+    Method = method,
+    `Total Systems` = n_total,
+    `Successfully Solved` = n_solvable,
+    `Win Rate (%)` = round(win_rate, 1),
+    `Median τ` = round(median_tau, 2),
+    `τ for 90% Solved` = round(tau_at_90_percent, 2)
+  )
+
+# Generate the kable table, which you can print directly into your document
+knitr::kable(
+  formatted_table,
+  format = "org",
+  caption = "Summary of performance profile metrics. 'Win Rate' is the percentage of systems for which a method was fastest. 'τ' (tau) is the performance ratio (Time / Best Time)."
+)
+#+end_src
+
+#+RESULTS[50e198e4f6361d48579b0cc158e57be15d92ee7b]:
+:results:
+#+CAPTION: Summary of performance profile metrics. 'Win Rate' is the percentage of systems for which a method was fastest. 'τ' (tau) is the performance ratio (Time / Best Time).
+
+|Method  | Total Systems| Successfully Solved| Win Rate (%)| Median τ| τ for 90% Solved|
+|<l>     |           <r>|                 <r>|          <r>|      <r>|              <r>|
+|--------+--------------+--------------------+-------------+---------+-----------------|
+|OTGPD   |           238|                 233|         70.6|     1.00|             1.00|
+|GPDimer |           238|                 230|         20.6|     1.39|             1.01|
+|Dimer   |           238|                 229|          8.8|     2.65|             1.01|
+:end:
+
+The metric upon the best value of the metric we define here as τ.
+
+Also of interest.
+
+#+begin_src R :results value :colnames yes :post round-tbl[:colnames yes](*this*)
+data_pes %>% group_by(method) %>% summarise(n=n(),mpes=mean(pes_calls), medpes=median(pes_calls), minpes=min(pes_calls), max=max(pes_calls))
+#+end_src
+
+#+RESULTS[31d0f4e4343f653a1c20e7b23001c064d83904d7]:
+| method  |   n |  mpes | medpes | minpes |  max |
+|---------+-----+-------+--------+--------+------|
+| Dimer   | 229 | 309.1 |    254 |     42 | 2666 |
+| GPDimer | 230 |  32.4 |     30 |     15 |  112 |
+| OTGPD   | 233 |  29.0 |     28 |     14 |   92 |
+
+With
+
+#+begin_src R :results value :colnames yes :post round-tbl[:colnames yes](*this*)
+plot_data %>% filter(success==TRUE) %>% group_by(method) %>% summarise(n=n(),mtime=mean(tot_time), medtime=median(tot_time), mintime=min(tot_time), max=max(tot_time))
+#+end_src
+
+#+RESULTS[2901b3aa988afe0a601b261b56dba7fc24ee332e]:
+| method  |   n | mtime | medtime | mintime |   max |
+|---------+-----+-------+---------+---------+-------|
+| Dimer   | 229 |  23.7 |    18.8 |     3.0 | 255.4 |
+| GPDimer | 230 |  28.3 |     9.9 |     1.5 | 637.0 |
+| OTGPD   | 233 |  12.6 |     7.3 |     0.5 | 111.4 |
+
+*** Case studies
+#+begin_src R :results discard
+sdff = load_system_data(c("d_110", "d_136"), "runs/rundata/cases/")
+#+end_src
+
+**** IA: D110
+
+Basically a single plot on the efficiency:
+
+Or as a two panel set.
+
+#+begin_src R
+pdat <- sdff %>% filter(system_id=='d_110')
+p1 <- plot_hyperparameters_srun(pdat) +
+ facet_wrap(~method, scales="free", ncol=2) +
+  labs(
+    title = NULL,
+    axis.title.y = NULL,
+  ) +
+  theme_Publication() +
+  theme(
+    title = element_blank(),
+    legend.title = element_blank(),
+    legend.position = "top",
+    legend.direction = "horizontal",
+    legend.position.inside = c(0.75, 0.9),
+  )
+ggsave("d110_hypopt.png", p1, width = 8, height = 6)
+#+end_src
+
+#+RESULTS[c7cb2a0485cc0fb3ce55eab61aea88deb39fee2f]:
+: d110_hypopt.png
+
+
+***** Caption
+#+begin_src R :results value :colnames yes :post round-tbl[:colnames yes](*this*)
+dfff %>% filter(system_id=="d_110") %>% select(system_id, method, tot_time, pes_calls)
+#+end_src
+
+#+RESULTS[7c5fdd7190175d6ebac5aee2f0022cfcb34845eb]:
+| system_id | method  | tot_time | pes_calls |
+|-----------+---------+----------+-----------|
+| d_110     | Dimer   |      8.5 |       104 |
+| d_110     | GPDimer |          |           |
+| d_110     | OTGPD   |      5.2 |        23 |
+
+**** IIIA: D136
+
+#+begin_src R :eval never
+plot_convergence_srun(d_110_otgpd)
+plot_performance_srun(d_110_otgpd)
+plot_hyperparameters_srun(d_110_otgpd)
+plot_distance_metric_srun(d_110_otgpd)
+#+end_src
+
+Basically a single plot on the efficiency:
+
+#+begin_src R :eval never :results graphics file :file ../d136_performance.png
+p1 <- plot_performance_srun(sdff %>% filter(system_id == "d_136")) +
+  theme_Publication() +
+  labs(
+    title = NULL,
+    axis.title.y = NULL,
+  ) +
+  theme(
+    ## White out what I don't need
+    title = element_blank(),
+    legend.position = "inside",
+    legend.position.inside = c(0.8, 0.8),
+  )
+ggsave("d136_performance.png", p1, width = 8, height = 6)
+#+end_src
+
+Or as a six panel set.
+
+#+begin_src R
+pdat <- sdff %>% filter(system_id == "d_136")
+p1 <- plot_performance_srun(pdat) +
+  theme_Publication() +
+  labs(
+    title = NULL,
+    axis.title.y = NULL,
+  ) +
+  theme(
+    title = element_blank(),
+    legend.title = element_blank(),
+    legend.position = "inside",
+    legend.position.inside = c(0.85, 0.95),
+  )
+p2 <- plot_hyperparameters_srun(pdat) +
+  facet_wrap(~method, scales = "free", ncol = 1) +
+  labs(
+    title = NULL,
+    axis.title.y = NULL,
+  ) +
+  theme_Publication() +
+  theme(
+    title = element_blank(),
+    legend.title = element_blank(),
+    legend.position = "inside",
+    legend.direction = "horizontal",
+    legend.key.spacing = unit(0.1, "cm"),
+    legend.position.inside = c(0.87, 0.92),
+  ) + guides(color= guide_legend(nrow=3))
+p3 <- plot_convergence_srun(pdat) +
+  facet_wrap(~method, scales = "free", ncol = 1) +
+  labs(
+    title = NULL,
+    axis.title.y = NULL,
+  ) +
+  theme_Publication() +
+  theme(
+    title = element_blank(),
+    legend.title = element_blank(),
+    legend.position = "inside",
+    legend.direction = "horizontal",
+    legend.position.inside = c(0.75, 0.9),
+    axis.title.y = element_text(margin = margin(r = -15)) # Decrease 'r' value (right margin)
+  )
+# Adding images
+# Data for the first image
+image_data_a <- tibble(
+  x_pos = 1,
+  y_pos = 1,
+  image_path = "imgs/d_136_init_thresh_o5.png"
+)
+
+# p4a: Initial
+p4a <- ggplot(image_data_a, aes(x = x_pos, y = y_pos)) +
+  geom_image(aes(image = image_path), size = 1.5) +
+  coord_cartesian(xlim = c(0.5, 1.5), ylim = c(0.5, 1.5)) +
+  theme_void() +
+  theme(
+    plot.background = element_rect(fill = NA, color = NA),
+    plot.margin = margin(0, 0, 0, 0)
+  )
+
+# Data for the second image
+image_data_b <- tibble(
+  x_pos = 1,
+  y_pos = 1,
+  image_path = "imgs/d_136_saddle_thresh_o5.png"
+)
+
+# Saddle
+p4b <- ggplot(image_data_b, aes(x = x_pos, y = y_pos)) +
+  geom_image(aes(image = image_path), size = 1.5) +
+  coord_cartesian(xlim = c(0.5, 1.5), ylim = c(0.5, 1.5)) +
+  theme_void() +
+  theme(
+    plot.background = element_rect(fill = NA, color = NA),
+    plot.margin = margin(0, 0, 0, 0)
+  )
+
+p_image_row <- p4a | p4b
+
+# Final Assembly
+pall <- ((p1 | p2 | p3) + plot_layout(axis_titles = "collect")) / p_image_row +
+  plot_layout(
+    # Use three heights: 1. Main plots (A, B, C), 2. Spacer, 3. Image row (D, E)
+    heights = c(4, 1), # Allocate 4x height to top plots, 1x to images
+    # Use three widths: to align images with plots (p1, p2, p3)
+    widths = c(1, 1) # Ensure columns align horizontally
+  ) +
+  plot_annotation(
+    tag_levels = list(c("A", "B", "C"), c("D", "E")), # Apply A, B, C to top, and D, E to bottom
+    theme = theme(plot.tag.position = c(0.01, 1), plot.margin = margin(t = 5, r = 5, b = 5, l = 5))
+  )
+ggsave("d136_6panel.png", pall, width = 20, height = 10)
+#+end_src
+
+
+***** Caption
+#+begin_src R :results value :colnames yes :post round-tbl[:colnames yes](*this*)
+find_matching_saddles_all(dfff, "method", levels(dfff$method)) %>% filter(num_fragments < 3) %>%
+  filter(method %in% c("GPDimer", "OTGPD")) %>%
+  select(system_id, method, tot_time) %>%
+  pivot_wider(
+    names_from = method,
+    values_from = tot_time
+  ) %>%
+  mutate(
+    time_gap = abs(GPDimer - OTGPD)
+  ) %>%
+  drop_na(time_gap) %>%
+  arrange(desc(time_gap)) %>%
+  filter(system_id=="d_136")
+  ## head(15)
+#+end_src
+
+#+RESULTS[2b2715bbd13f19eecf5485195f8401bc9fdcfdc8]:
+| system_id | GPDimer | OTGPD | time_gap |
+|-----------+---------+-------+----------|
+| d_136     |    45.8 |  19.9 |     25.8 |
+
+Where we calculate HOD activation with:
+#+begin_src bash :eval never
+ag --ignore "sync_results" -z "increasing" 2>/dev/null | awk '/\.log\.gz/ { split($0, a, "/"); printf "%s_%d\n", substr(a[1], 1, 1), a[2] + 0; }' | sort -u
+#+end_src
+
+Also.
+
+#+begin_src R :results value :colnames yes :post round-tbl[:colnames yes](*this*)
+dfff %>%  filter(method %in% c("GPDimer", "OTGPD"), system_id=="d_136") %>%
+  select(system_id, method, tot_time, pes_calls)
+#+end_src
+
+#+RESULTS[57f2fcb1c3c904de8c4dad29931ae6cccc0c7818]:
+| system_id | method  | tot_time | pes_calls |
+|-----------+---------+----------+-----------|
+| d_136     | GPDimer |     45.8 |        39 |
+| d_136     | OTGPD   |     19.9 |        28 |
+
+Finally:
+
+#+begin_src R :results value :colnames yes :post round-tbl[:colnames yes](*this*)
+total_cost_metrics <- sdff %>%
+  filter(system_id == "d_136", method %in% c("GPDimer", "OTGPD")) %>%
+  group_by(system_id, method) %>%
+  summarise(
+    Total_Func_Calls = sum(func_count),
+    Total_Optimization_Time_s = sum(optimize_time),
+    Number_of_Iterations = n(),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    Avg_Time_Per_Iter_s = Total_Optimization_Time_s / Number_of_Iterations,
+    Avg_Func_Per_Iter = Total_Func_Calls / Number_of_Iterations,
+    Time_Per_Func_Call_s = Total_Optimization_Time_s / Total_Func_Calls
+  )
+
+print(total_cost_metrics)
+#+end_src
+
+#+RESULTS[0fc1956afcc8e0047ed8920ad680c69192e76529]:
+| system_id | method  | Total_Func_Calls | Total_Optimization_Time_s | Number_of_Iterations | Avg_Time_Per_Iter_s | Avg_Func_Per_Iter | Time_Per_Func_Call_s |
+|-----------+---------+------------------+---------------------------+----------------------+---------------------+-------------------+----------------------|
+| d_136     | GPDimer |              403 |                    2235.2 |                   34 |                65.7 |              11.9 |                  5.5 |
+| d_136     | OTGPD   |             3974 |                    8527.0 |                  279 |                30.6 |              14.2 |                  2.1 |
+

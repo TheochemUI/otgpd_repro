@@ -1,0 +1,1260 @@
+# -*- org-src-preserve-indentation: t; org-edit-src-content: 0; -*-
+#+TITLE: Supplementary II: Bayesian Model
+#+AUTHOR: Rohit Goswami
+#+EMAIL: rog32@hi.is
+# This should not be altered
+#+OPTIONS: toc:nil title:nil todo:nil
+# I need the footnotes to be inlined
+#+STARTUP: fninline
+
+* Configuration :ignoreheading:ignore:noexport:
+  :PROPERTIES:
+  :VISIBILITY: folded
+  :END:
+#+BEGIN_SRC emacs-lisp :exports none :eval always :results none
+(require 'ox-extra)
+(ox-extras-activate '(ignore-headlines))
+;; Optional, should probably be in the user config
+(setq 'org-hide-emphasis-markers t)
+#+END_SRC
+** Theme :ignoreheading:ignore:
+#+HTML_HEAD: <link rel="stylesheet" type="text/css" href="https://gongzhitaao.org/orgcss/org.css"/>
+#+BEGIN_SRC emacs-lisp :exports none :results none :eval always
+(setq org-html-head-include-default-style nil)
+(setq org-html-htmlize-output-type 'css)
+#+END_SRC
+** Code Properties :ignoreheading:ignore:
+# Set headers everywhere
+# #+PROPERTY: header-args:R :session oneR :results output :exports both :cache yes :tangle rcode.R
+There's no need to expand the ~noweb~ bits while exporting, but it can be useful to debug:
+#+property: header-args :noweb no-export
+*** Formatting R dataframes
+#+NAME: round-tbl
+#+BEGIN_SRC emacs-lisp :var tbl="" :var fmt="%.1f"
+;; Kanged from https://brettpresnell.com/post/orgmode/
+  (mapcar (lambda (row)
+	    (mapcar (lambda (cell)
+		      (if (floatp cell)
+			  (format fmt cell)
+			cell))
+		    row))
+	  tbl)
+#+end_src
+
+#+RESULTS: round-tbl
+
+* Start Here :ignoreheading:ignore:
+* TODO Integrate with ~analysis~
+At the moment the environment is different since ~brms~ cannot use the latest and greatest ~R~.
+* Baseline variables
+We need some directories to ground the analysis.
+#+begin_src bash :session shared :results value none :async yes
+export PIXI_NO_PROGRESS=true
+#+end_src
+
+* R wrangling
+:PROPERTIES:
+:header-args:R: :session modelR :results value :exports both :cache yes :tangle 01_model_rcode.R
+:END:
+
+#+begin_src emacs-lisp :results none
+(let ((git-root-path (replace-regexp-in-string "\n" "" (shell-command-to-string "git rev-parse --show-toplevel"))))
+  ;; This variable is for the interactive ESS process, which is what you want for :session
+  ;; XXX(rg): See TODO, this differs from the visualization variant!
+  (setq inferior-R-program
+        (concat git-root-path "/.pixi/envs/brms/bin/R")))
+#+end_src
+
+#+begin_src R :results none
+library('httpgd')
+library('ragg')
+library('tidybayes')
+library('tidyverse')
+library('brms')
+# Sometimes needs to be killed with lsof -i tcp:$PORT and kill -9 $PID
+## hgd(port=9890)
+#+end_src
+
+#+begin_src R :results none
+gen_data <- function(fname) {
+  res <- read_csv(fname)
+  res %>% mutate(
+        ## TODO(rg): Total time needs to be explicitly mentioned in s
+        method = as.factor(
+          case_when(
+            method == "GPRD" ~ "GPDimer",
+            method == "OTGP" ~ "OTGPD",
+            method == "IDimer" ~ "Dimer",
+            .default = as.character(method)
+          )
+        ),
+        dimer_rot = as.factor(dimer_rot),
+        dimer_trans = as.factor(dimer_trans),
+        mol_id = as.factor(mol_id),
+        spin = as.factor(spin),
+        termination_status = as.factor(termination_status),
+        tot_time = tot_time / 60, ## Seconds to minutes
+        system_id = as.factor(
+          paste(str_sub(spin, 0, 1),
+                mol_id, sep='_')
+        ),
+        ) %>%
+        dplyr::relocate(
+          system_id, pes_calls,
+          tot_time,
+          everything()
+        ) -> res
+  return(res)
+}
+#+end_src
+
+#+begin_src R :results discard
+data_idimer = gen_data('runs/rundata/jctc/data_idimer_cgrot_lbfgs.csv')
+data_gprd = gen_data('runs/rundata/jctc/data_gprd.csv')
+data_otgp = gen_data('runs/rundata/data_otgp.csv')
+dfff <- bind_rows(data_idimer, data_gprd, data_otgp)
+#+end_src
+
+#+RESULTS:
+
+*** Fragment details
+
+We classify fragments as those that have a Wiberg-Mayer bond order of greater than 0.7 and have geometric centers within one Angstrom of the fragments.
+
+#+begin_src R :results none
+read_fragments <- function(fname, spin) {
+  df <- read_csv(fname,
+    col_types = cols(
+      filename = col_character(),
+      num_fragments = col_integer(),
+      fragment_sizes = col_character()
+    )
+  ) %>%
+    mutate(
+      base_number = str_remove(filename, pattern = "\\.xyz$"),
+      system_id = as.factor(paste0(spin, "_", base_number)),
+      fragment_sizes_list = str_split(fragment_sizes, pattern = ","),
+      fragment_sizes = purrr::map(fragment_sizes_list, as.numeric)
+    ) %>%
+    select(system_id, num_fragments, fragment_sizes)
+  return(df)
+}
+#+end_src
+
+#+begin_src R :results none
+fragments <- bind_rows(
+  read_fragments("runs/automated/singlet_wbo_1ang.csv", "s"),
+  read_fragments("runs/automated/doublet_wbo_1ang.csv", "d")
+)
+dfff <- dfff %>% left_join(fragments)
+#+end_src
+
+** Auxiliary Functions
+To find the missing values.
+
+#+begin_src R :results none
+find_missing_in_x <- function(df, x_col, x_method) {
+  # 1. Filter data for all data and X methods
+  all_ids <- df %>%
+    select(mol_id, spin, system_id) %>%
+    distinct()
+
+  x_data <- df %>%
+    filter(success == TRUE) %>%
+    filter(.data[[x_col]] == x_method) %>%
+    select(mol_id, spin, system_id) %>%
+    distinct()
+
+  # 2. Find combinations missing in X
+  missing_in_x <- anti_join(all_ids, x_data, by = c("mol_id", "spin", "system_id"))
+
+  return(missing_in_x)
+}
+#+end_src
+
+Also for filtering to the same saddles.
+
+#+begin_src R :results none
+find_matching_saddles <- function(df, comparison_col, level1, level2, tolerance = 0.01, diff_in = "barrier") {
+  # Args:
+  #   df: Input data frame.
+  #   comparison_col: Column for comparison (e.g., "method", "dimer_rot").
+  #   level1: First level within comparison_col (e.g., "GPR-Dimer", "cg").
+  #   level2: Second level within comparison_col (e.g., "Sella", "lbfgs").
+  #   tolerance: Maximum allowed difference in barrier heights.
+  # Returns: Filtered data frame.
+
+  # Input validation
+  if (!all(c("success", comparison_col, "mol_id", "spin", "barrier") %in% colnames(df))) {
+    stop("Input DataFrame must have columns 'success', '", comparison_col, "', 'mol_id', 'spin', and 'barrier'.")
+  }
+  if (!is.numeric(tolerance) || tolerance < 0) {
+    stop("`tolerance` must be a non-negative number.")
+  }
+  if (!is.character(level1) || length(level1) != 1 ||
+      !is.character(level2) || length(level2) != 1) {
+    stop("`level1` and `level2` must be single character strings.")
+  }
+  if (level1 == level2){
+        stop("level1 and level2 must be distinct")
+  }
+      # Check if comparison levels exist
+    if (!all(c(level1, level2) %in% unique(df[[comparison_col]]))) {
+      missing_levels <- setdiff(c(level1, level2), unique(df[[comparison_col]]))
+      stop("Comparison levels not found in the data: ", paste(missing_levels, collapse=", "))
+    }
+
+
+  # Dynamically create column names
+  level1_barrier_col <- paste0(level1, "_barrier")
+  level2_barrier_col <- paste0(level2, "_barrier")
+
+  # --- EXACT Replication of Original Logic ---
+  result_df <- df %>%
+    filter(success == TRUE) %>%
+    group_by(mol_id, spin) %>%
+    mutate(
+      !!level1_barrier_col := ifelse(any(.data[[comparison_col]] == level1),
+                                     .data[[diff_in]][.data[[comparison_col]] == level1],
+                                     NA_real_),
+      !!level2_barrier_col := ifelse(any(.data[[comparison_col]] == level2),
+                                     .data[[diff_in]][.data[[comparison_col]] == level2],
+                                     NA_real_)
+    ) %>%
+      filter(abs(abs(.data[[level1_barrier_col]]) - abs(.data[[level2_barrier_col]])) <= tolerance) %>% #compare the diffs
+    ungroup() %>%
+    filter(.data[[comparison_col]] %in% c(level1, level2)) %>% # Keep only requested
+    select(-all_of(c(level1_barrier_col, level2_barrier_col))) # Remove created columns.
+
+  return(result_df)
+}
+#+end_src
+
+Going beyond pairwise filters for saddles..
+
+#+begin_src R :results none
+find_matching_saddles_all <- function(df, comparison_col, levels, tolerance = 0.01) {
+  # Args:
+  #   df: Input data frame.
+  #   comparison_col: Column for comparison (e.g., "method", "dimer_rot").
+  #   levels: A character vector of all levels to compare.
+  #   tolerance: Maximum allowed difference in barrier heights.
+  # Returns: Filtered data frame.
+
+  # Input validation
+  if (!all(c("success", comparison_col, "mol_id", "spin", "barrier") %in% colnames(df))) {
+    stop("Input DataFrame must have columns 'success', '", comparison_col, "', 'mol_id', 'spin', and 'barrier'.")
+  }
+  if (!is.numeric(tolerance) || tolerance < 0) {
+    stop("`tolerance` must be a non-negative number.")
+  }
+  if (!is.character(levels) || length(levels) < 2) {
+    stop("`levels` must be a character vector with at least two elements.")
+  }
+  if (any(duplicated(levels))){
+    stop("`levels` must contain unique values")
+  }
+
+  # Check if comparison levels exist
+  if (!all(levels %in% unique(df[[comparison_col]]))) {
+    missing_levels <- setdiff(levels, unique(df[[comparison_col]]))
+    stop("Comparison levels not found in the data: ", paste(missing_levels, collapse=", "))
+  }
+
+  n_levels <- length(levels)
+  barrier_cols <- paste0(levels, "_barrier")
+
+  result_df <- df %>%
+    filter(success == TRUE) %>%
+    group_by(mol_id, spin)
+
+    #Dynamically create barrier columns
+    for (i in seq_along(levels)){
+        level <- levels[i]
+        barrier_col <- barrier_cols[i]
+        result_df <- result_df %>%
+            mutate(!!barrier_col := ifelse(any(.data[[comparison_col]] == level),
+                                           barrier[.data[[comparison_col]] == level],
+                                           NA_real_))
+    }
+
+  result_df <- result_df %>%
+    filter(if_all(all_of(barrier_cols), ~!is.na(.))) #Check if all barriers are present
+
+  #Compare all barrier heights
+  for (i in 1:(n_levels - 1)) {
+    for (j in (i + 1):n_levels) {
+      level1_barrier_col <- barrier_cols[i]
+      level2_barrier_col <- barrier_cols[j]
+      result_df <- result_df %>%
+        filter(abs(abs(.data[[level1_barrier_col]]) - abs(.data[[level2_barrier_col]])) <= tolerance)
+    }
+  }
+
+  result_df <- result_df %>%
+    ungroup() %>%
+    filter(.data[[comparison_col]] %in% levels) %>%
+    select(-all_of(barrier_cols)) # Remove created columns.
+
+  return(result_df)
+}
+#+end_src
+
+*** ~brms~ helpers
+
+#+begin_src R :results none
+load_brms_model <- function(file_path, formula, data, family, prior,
+                             chains = 4, iter = 4000, warmup = 1000,
+                             cores = 4, seed = 1995, backend = "cmdstanr",
+                             control = list(adapt_delta=0.99, max_treedepth=15)) {
+  # Check if the file exists
+  if (file.exists(file_path)) {
+    message("Loading existing model from: ", file_path)
+    model <- readRDS(file_path)
+
+    # VERY IMPORTANT: Check if the loaded model matches the requested model
+    # This prevents accidentally using an old model with different data/formula/etc.
+    if (!identical((model$formula %>% as.character)[1], (formula %>% as.character)[1])) {
+      stop("Loaded model's formula does not match the requested formula.")
+    }
+    if (!identical(model$data, data)) {
+        warning("Loaded model's data does not match. Proceed with extreme caution, may be wrong.")
+        #stop("Loaded model's data does not match the requested data.") # could also choose to stop
+    }
+    # You *could* add checks for family, prior, etc., but formula and data are the most critical
+    # to avoid silent errors.
+
+    return(model)
+  } else {
+    message("Model file not found. Fitting new model and saving to: ", file_path)
+    model <- brm(
+      formula = formula,
+      data = data,
+      family = family,
+      prior = prior,
+      chains = chains,
+      iter = iter,
+      warmup = warmup,
+      cores = cores,
+      control = control,
+      seed = seed,
+      backend = backend,
+      file = file_path  # Save the newly fitted model
+    )
+    return(model)
+  }
+}
+#+end_src
+
+Also to conditionally load or compute.
+
+#+begin_src R :results none
+get_or_compute_epreds <- function(model, newdata, filename, ...) {
+
+  # --- Input Validation (Basic) ---
+  if (!inherits(model, "brmsfit")) {
+    stop("'model' must be a brmsfit object.")
+  }
+  if (!is.data.frame(newdata)) {
+    stop("'newdata' must be a data frame.")
+  }
+  if (!is.character(filename) || length(filename) != 1 || nchar(filename) == 0) {
+    stop("'filename' must be a non-empty character string path.")
+  }
+  if (!grepl("\\.rds$", filename, ignore.case = TRUE)) {
+    warning("Filename '", filename, "' does not end with .rds. Using the .rds extension is recommended for clarity.")
+  }
+  # Ensure brms namespace is available
+  if (!requireNamespace("brms", quietly = TRUE)) {
+    stop("Package 'brms' is required but not installed/loaded.")
+  }
+
+  # --- Check for Cached File ---
+  if (file.exists(filename)) {
+    # Load from file
+    message("Cache file found. Loading pre-computed epreds from: '", filename, "'")
+    results <- tryCatch({
+        ## Kanged from https://coolbutuseless.github.io/2018/10/02/using-lz4-and-zstandard-to-compress-files-with-saverds/
+        con <- archive::file_read(file = filename)
+        res<-readRDS(con)
+        close(con)
+        res
+      }, error = function(e) {
+        # Handle potential errors during loading (e.g., corrupted file)
+        stop("Error loading file '", filename, "': ", e$message)
+    })
+    message("Loading complete.")
+
+  } else {
+    # Compute and Save
+    message("Cache file not found: '", filename, "'")
+    message("Computing epreds using brms::add_epred_draws (this might take a while)...")
+
+    # Create directory if it doesn't exist, before trying to save
+    output_dir <- dirname(filename)
+    if (!dir.exists(output_dir)) {
+        message("Creating output directory: '", output_dir, "'")
+        dir.create(output_dir, recursive = TRUE, showWarnings = FALSE) # Suppress warning if dir already exists due to race condition
+        if (!dir.exists(output_dir)) { # Check again if creation failed
+             stop("Failed to create output directory: '", output_dir, "'. Check permissions.")
+        }
+    }
+
+
+    # Compute using add_epred_draws, passing extra arguments via ...
+    results <- tryCatch({
+      tidybayes::add_epred_draws(
+        object = model,
+        newdata = newdata,
+        ... # Pass arguments like ndraws, allow_new_levels, re_formula, seed etc.
+      )
+    }, error = function(e) {
+      # Handle potential errors during computation
+      stop("Error during brms::add_epred_draws computation: ", e$message)
+    })
+
+    message("Computation complete.")
+    message("Saving results to: '", filename, "'")
+
+    # Save the computed results
+    tryCatch({
+      ## Kanged from https://coolbutuseless.github.io/2018/10/02/using-lz4-and-zstandard-to-compress-files-with-saverds/
+      con = archive::file_write(file = filename, filter="zstd", options = "compression-level=22")
+      open(con)
+      saveRDS(results, con)
+      message("Save complete.")
+    }, error = function(e) {
+      # Warn if saving fails, but still return results if computation succeeded
+      warning("Error saving results to '", filename, "': ", e$message)
+      warning("Computation succeeded, but results could not be cached to disk.")
+    })
+  }
+
+  return(results)
+}
+#+end_src
+
+** Theme
+
+Along with a modified theme initially [[https://rpubs.com/Koundy/71792][from here]].
+
+We'd like to use more of the hyperlegible fonts.
+#+begin_src R :results discard
+library(showtext)
+font_add_google("Atkinson Hyperlegible", "Atkinson")
+showtext_auto()
+#+end_src
+
+#+RESULTS:
+
+#+begin_src R :results none
+# Matplotlib has floralwhite which is FFFAF0, but FAF7F0 is a bit nicer
+# Actually for the paper, just stick to #FFFFFF
+theme_Publication <- function(base_size = 36, base_family = "Atkinson") {
+  library(grid)
+  library(ggthemes)
+  (theme_foundation(base_size = base_size, base_family = base_family)
+  + theme(
+      plot.title = element_text(
+        face = "bold",
+        size = rel(2.2), hjust = 0.5
+      ),
+      text = element_text(),
+      panel.background = element_rect(colour = NA, fill = "#FFFFFF"),
+      plot.background = element_rect(colour = NA, fill = "#FFFFFF"),
+      plot.tag = element_text(face = "bold"),
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 1),
+      axis.title = element_text(face = "bold", size = rel(1.8)),
+      axis.title.y = element_text(angle = 90, vjust = 2),
+      axis.title.x = element_text(vjust = -0.2),
+      axis.text = element_text(size = rel(1.8)),
+      axis.line = element_line(colour = "black"),
+      axis.ticks = element_line(),
+      panel.grid.major = element_line(colour = "#e6e3dd"),
+      panel.grid.minor = element_blank(),
+      legend.background = element_rect(fill = "#FFFFFF", colour = NA),
+      legend.key = element_rect(colour = NA, fill = "#FFFFFF"),
+      legend.position = "right",
+      legend.direction = "vertical",
+      legend.key.size = unit(0.8, "cm"),
+      legend.margin = margin(unit(0, "cm")),
+      legend.title = element_text(face = "italic", size = rel(1.6)),
+      legend.text = element_text(size = rel(1.8)),
+      plot.margin = unit(c(10, 5, 5, 5), "mm"),
+      strip.background = element_rect(colour = "#FFFFFF", fill = "#FFFFFF"),
+      strip.text = element_text(face = "bold", size = rel(1.5))
+    ))
+}
+
+## TODO(rg): These are basically the Okabe-Ito ones, from Khroma
+okabe_ito_colors <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7", "#999999")
+scale_fill_Publication <- function(...) {
+  library(scales)
+  discrete_scale("fill", "Publication", manual_pal(values = okabe_ito_colors), ...)
+}
+
+scale_color_Publication <- function(...) {
+  library(scales)
+  discrete_scale("color", "Publication", manual_pal(values = okabe_ito_colors), ...)
+}
+#+end_src
+
+With some more variables.
+
+#+begin_src R :results none
+okabe_ito_colors <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7", "#999999")
+scale_fill_Publication <- function(...) {
+  library(scales)
+  discrete_scale("fill", "Publication", manual_pal(values = okabe_ito_colors), ...)
+}
+#+end_src
+
+** Bayesian models
+*** Priors
+**** Performance
+Priors for the total time and PES calls.
+
+#+begin_src R :results none
+prior_list <- c(
+  prior(normal(0, 1), class = "b"),  # Weakly informative prior for fixed effects
+  prior(student_t(3, 0, 2.5), class = "Intercept"), # Prior for intercept
+  prior(exponential(1), class = "sd"),  # Prior for random effect SD
+  prior(gamma(2, 0.1), class = "shape") # Prior for neg. binom. shape parameter
+)
+#+end_src
+
+**** Success
+While for the success probability we have:
+
+#+begin_src R :results none
+# A normal distribution centered at 0 with a standard
+# deviation of 2.5. This allows for odds ratios between about 0.01 and 100,
+# which covers most plausible effects.
+prior_list_success <- c(
+  prior(normal(0, 2.5), class = "b"),     # Prior for population-level effects
+  prior(student_t(3, 0, 2.5), class = "sd") # Prior for standard deviation of group-level effects
+)
+#+end_src
+
+** PES Call Models
+#+begin_src R :results none
+## cmdstanr::set_cmdstan_path('/home/rgoswami/Git/Github/TheochemUI/gprdzbl/.pixi/envs/brms/bin/cmdstan')
+## cmdstanr::cmdstan_make_local(cpp_options = list(CXX17FLAGS = "-O3 -std=c++17"))
+#+end_src
+*** GP acceleration Algorithms
+#+begin_src R :results value :colnames yes :post round-tbl[:colnames yes](*this*)
+dfff %>% filter(success==TRUE, num_fragments < 3) -> dbrms_pes
+dbrms_pes %>%
+  group_by(method) %>%
+  summarize(n=n(), mean=mean(pes_calls), median=median(pes_calls))
+#+end_src
+
+#+RESULTS[a60b960df868c78856061439a65182af0e71b44c]:
+| method  |   n |  mean | median |
+|---------+-----+-------+--------|
+| Dimer   | 229 | 309.1 |    254 |
+| GPDimer | 230 |  32.4 |     30 |
+| OTGPD   | 233 |  29.0 |     28 |
+
+
+#+begin_src R :results discard
+brms_pes <- load_brms_model(
+  file_path = "data/models/brms_pes.rds",
+  formula = brmsformula(pes_calls ~ method + (1 | mol_id:spin)),
+  data = dbrms_pes,
+  family = negbinomial(link = "log"),
+  prior = prior_list,
+  chains = 4,
+  iter = 4000,
+  warmup = 1000,
+  cores = 4,
+  seed = 1995,
+  backend = "cmdstanr"
+)
+#+end_src
+
+#+RESULTS:
+
+#+begin_src R :results output
+summary(brms_pes)
+#+end_src
+
+#+RESULTS[38a37578ebaa408ec9da911f6e9d220e4ef01204]:
+#+begin_example
+ Family: negbinomial
+  Links: mu = log
+Formula: pes_calls ~ method + (1 | mol_id:spin)
+   Data: data (Number of observations: 692)
+  Draws: 4 chains, each with iter = 4000; warmup = 1000; thin = 1;
+         total post-warmup draws = 12000
+
+Multilevel Hyperparameters:
+~mol_id:spin (Number of levels: 238)
+              Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+sd(Intercept)     0.35      0.02     0.31     0.40 1.00     4042     7082
+
+Regression Coefficients:
+              Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+Intercept         5.61      0.03     5.55     5.67 1.00     6816     7994
+methodGPDimer    -2.16      0.03    -2.22    -2.10 1.00    17086     9663
+methodOTGPD      -2.26      0.03    -2.32    -2.20 1.00    16874     9285
+
+Further Distributional Parameters:
+      Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+shape    11.26      0.87     9.65    13.03 1.00     7688     8984
+
+Draws were sampled using sample(hmc). For each parameter, Bulk_ESS
+and Tail_ESS are effective sample size measures, and Rhat is the potential
+scale reduction factor on split chains (at convergence, Rhat = 1).
+#+end_example
+
+#+begin_src R :results value :colnames yes :post round-tbl[:colnames yes](*this*)
+param_draws_pes <- brms_pes %>%
+  tidy_draws() %>%
+  # Select fixed effects and random effect SD
+  # get_variables(brms_pes)
+  select(b_Intercept, b_methodGPDimer, b_methodOTGPD, `sd_mol_id:spin__Intercept`)
+
+# --- 2. Calculate Summaries for Each Parameter Type ---
+
+# 2a. Intercept (Expected Value)
+summary_intercept <- param_draws_pes %>%
+  mutate(response_value = exp(b_Intercept)) %>%
+  summarize(
+    median_val = median(response_value),
+    lower_95 = quantile(response_value, 0.025),
+    upper_95 = quantile(response_value, 0.975)
+  ) %>%
+  mutate(
+    Effect_Type = "Expected PES Calls (Baseline: Dimer)",
+    `Median Effect` = sprintf("%.1f", median_val),
+    `95% CrI` = paste0("[", sprintf("%.1f", lower_95), ", ", sprintf("%.1f", upper_95), "]")
+  ) %>%
+  select(Effect_Type, `Median Effect`, `95% CrI`)
+
+# 2b. GPDimer Effect (Multiplicative Factor AND Percentage Change)
+summary_gpd <- param_draws_pes %>%
+  mutate(
+    mult_factor = exp(b_methodGPDimer),
+    perc_change = (mult_factor - 1) * 100
+  ) %>%
+  summarize(
+    median_mult = median(mult_factor),
+    lower_mult = quantile(mult_factor, 0.025),
+    upper_mult = quantile(mult_factor, 0.975),
+    median_perc = median(perc_change),
+    lower_perc = quantile(perc_change, 0.025),
+    upper_perc = quantile(perc_change, 0.975)
+  )
+
+# Format Multiplicative Factor Row
+formatted_gpd_mult <- summary_gpd %>%
+  mutate(
+    Effect_Type = "Multiplicative Factor (GPDimer vs Dimer)",
+    `Median Effect` = sprintf("%.2f", median_mult), # Use more decimals for factor near 1
+    `95% CrI` = paste0("[", sprintf("%.2f", lower_mult), ", ", sprintf("%.2f", upper_mult), "]")
+  ) %>%
+  select(Effect_Type, `Median Effect`, `95% CrI`)
+
+# Format Percentage Change Row
+formatted_gpd_perc <- summary_gpd %>%
+  mutate(
+    Effect_Type = "Percentage Change (GPDimer vs Dimer)",
+    `Median Effect` = sprintf("%.1f%%", median_perc), # Add percent sign
+    `95% CrI` = paste0("[", sprintf("%.1f%%", lower_perc), ", ", sprintf("%.1f%%", upper_perc), "]") # Add percent signs
+  ) %>%
+  select(Effect_Type, `Median Effect`, `95% CrI`)
+
+
+# 2c. OTGPD Effect (Multiplicative Factor AND Percentage Change)
+summary_otgpd <- param_draws_pes %>%
+  mutate(
+    mult_factor = exp(b_methodOTGPD),
+    perc_change = (mult_factor - 1) * 100
+  ) %>%
+  summarize(
+    median_mult = median(mult_factor),
+    lower_mult = quantile(mult_factor, 0.025),
+    upper_mult = quantile(mult_factor, 0.975),
+    median_perc = median(perc_change),
+    lower_perc = quantile(perc_change, 0.025),
+    upper_perc = quantile(perc_change, 0.975)
+  )
+
+# Format Multiplicative Factor Row
+formatted_otgpd_mult <- summary_otgpd %>%
+  mutate(
+    Effect_Type = "Multiplicative Factor (OTGPD vs Dimer)",
+    `Median Effect` = sprintf("%.2f", median_mult), # Use more decimals for factor near 1
+    `95% CrI` = paste0("[", sprintf("%.2f", lower_mult), ", ", sprintf("%.2f", upper_mult), "]")
+  ) %>%
+  select(Effect_Type, `Median Effect`, `95% CrI`)
+
+# Format Percentage Change Row
+formatted_otgpd_perc <- summary_otgpd %>%
+  mutate(
+    Effect_Type = "Percentage Change (OTGPD vs Dimer)",
+    `Median Effect` = sprintf("%.1f%%", median_perc), # Add percent sign
+    `95% CrI` = paste0("[", sprintf("%.1f%%", lower_perc), ", ", sprintf("%.1f%%", upper_perc), "]") # Add percent signs
+  ) %>%
+  select(Effect_Type, `Median Effect`, `95% CrI`)
+
+
+# 2d. Random Effect SD
+summary_sd <- param_draws_pes %>%
+    select(sd_intercept_col = `sd_mol_id:spin__Intercept`) %>%
+    summarize(
+        median_sd = median(sd_intercept_col),
+        lower_sd = quantile(sd_intercept_col, 0.025),
+        upper_sd = quantile(sd_intercept_col, 0.975)
+    ) %>%
+  mutate(
+    Effect_Type = "sd(Intercept) [mol_id:spin]",
+    `Median Effect` = sprintf("%.2f", median_sd),
+    `95% CrI` = paste0("[", sprintf("%.2f", lower_sd), ", ", sprintf("%.2f", upper_sd), "]")
+  ) %>%
+  select(Effect_Type, `Median Effect`, `95% CrI`)
+
+
+# --- 3. Combine All Summaries ---
+combined_summary_pes_full <- bind_rows(
+  summary_intercept,
+  formatted_gpd_mult,
+  formatted_gpd_perc,
+  formatted_otgpd_mult,
+  formatted_otgpd_perc,
+  summary_sd
+) %>%
+  # Optional: Set desired order
+  mutate(Effect_Type = factor(Effect_Type, levels = c(
+    "Expected PES Calls (Baseline: Dimer)",
+    "Multiplicative Factor (GPDimer vs Dimer)",
+    "Percentage Change (GPDimer vs Dimer)",
+    "Multiplicative Factor (OTGPD vs Dimer)",
+    "Percentage Change (OTGPD vs Dimer)",
+    "sd(Intercept) [mol_id:spin]"
+  ))) %>%
+  arrange(Effect_Type)
+
+
+# --- 4. Output ---
+combined_summary_pes_full
+#+end_src
+
+#+RESULTS[79bc9834f331e043c0e76405afa79e5dc7090bfa]:
+| Effect_Type                              | Median Effect | 95% CrI          |
+|------------------------------------------+---------------+------------------|
+| Expected PES Calls (Baseline: Dimer)     |         272.8 | [256.7, 289.9]   |
+| Multiplicative Factor (GPDimer vs Dimer) |           0.1 | [0.11, 0.12]     |
+| Percentage Change (GPDimer vs Dimer)     |        -88.4% | [-89.1%, -87.7%] |
+| Multiplicative Factor (OTGPD vs Dimer)   |           0.1 | [0.10, 0.11]     |
+| Percentage Change (OTGPD vs Dimer)       |        -89.6% | [-90.2%, -88.9%] |
+| sd(Intercept) [mol_id:spin]              |           0.3 | [0.31, 0.40]     |
+
+
+Or more simply.
+
+#+begin_src R :results value :colnames yes :post round-tbl[:colnames yes](*this*)
+# --- 1. Extract and transform draws with tidybayes ---
+# spread_draws gets the posterior draws for each parameter into a clean format
+effect_draws <- brms_pes %>%
+  spread_draws(b_Intercept, b_methodGPDimer, b_methodOTGPD) %>%
+  mutate(
+    # Transform the Intercept to expected PES calls
+    `Expected PES Calls (Dimer)` = exp(b_Intercept),
+    # Transform the coefficients to percentage change
+    `Percentage Change (GPDimer vs Dimer)` = (exp(b_Intercept + b_methodGPDimer) / exp(b_Intercept) - 1) * 100,
+    `Percentage Change (OTGPD vs Dimer)` = (exp(b_Intercept + b_methodOTGPD) / exp(b_Intercept) - 1) * 100
+  )
+
+# --- 2. Calculate medians and credible intervals ---
+# Select the transformed variables and calculate the median and 95% HDI
+summary_table <- effect_draws %>%
+  select(starts_with("Expected"), starts_with("Percentage")) %>%
+  pivot_longer(everything(), names_to = "Effect", values_to = "value") %>%
+  group_by(Effect) %>%
+  median_hdi(.width = 0.95)
+
+print(summary_table)
+#+end_src
+
+#+RESULTS[f6a6ad221ffe2d67c74b5c00c2549713bea93f5b]:
+| Effect                               | value | .lower | .upper | .width | .point | .interval |
+|--------------------------------------+-------+--------+--------+--------+--------+-----------|
+| Expected PES Calls (Dimer)           | 272.8 |  256.8 |  290.0 |    0.9 | median | hdi       |
+| Percentage Change (GPDimer vs Dimer) | -88.4 |  -89.1 |  -87.7 |    0.9 | median | hdi       |
+| Percentage Change (OTGPD vs Dimer)   | -89.6 |  -90.2 |  -88.9 |    0.9 | median | hdi       |
+
+**** Plots
+Along with some for the residual analysis.
+#+begin_src R :async yes :results none
+model_data_pes <- get_or_compute_epreds(model=brms_pes,
+                                          newdata = dbrms_pes,
+                                          filename = "data/models/preds/brms_pes.rds",
+                                          allow_new_levels=TRUE)
+
+model_data_pes <- model_data_pes %>%
+  group_by(.row) %>%
+  summarise(.epred = median(.epred),
+            pes_calls = unique(pes_calls),
+            dimer_rot = unique(dimer_rot)) %>%
+  mutate(residual = pes_calls - .epred)
+#+end_src
+
+These residuals below show some heteroscedasticity, but the point is not perfect model fits.
+#+begin_src R
+ggplot(model_data_pes, aes(x = .epred, y = residual)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(x = "Predicted PES Calls", y = "Residuals",
+       title = "Residuals vs. Predicted Values") +
+  theme_Publication()
+## ggsave("brms_pes_clbfgs_norot_resid.png")
+#+end_src
+
+The box plot indicates that there is no systematic bias, so it is good enough for relative comparisons.
+
+#+begin_src R :results none
+ggplot(model_data_norot, aes(x = dimer_rot, y = residual, color = dimer_rot)) +
+  geom_boxplot() +  # Use a boxplot to show the distribution of residuals
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  scale_color_manual(values = c("cg" = "red", "lbfgs" = "blue")) + # Consistent colors
+  labs(x = "Optimizer", y = "Residuals",
+       title = "Residuals by Optimizer", color = "Optimizer") +
+  theme_Publication()+
+  theme(legend.position = "none")
+ggsave("brms_pes_clbfgs_norot_boxplot.png")
+#+end_src
+
+** Total time models
+Keep the systems which converge to the same saddles since otherwise the time measure makes no sense.
+
+#+begin_src R :results value :colnames yes :post round-tbl[:colnames yes](*this*)
+dbrms_time <- find_matching_saddles_all(dfff, "method", levels(dfff$method)) %>% filter(num_fragments < 3) %>% mutate(log_pes_calls=log(pes_calls), num_fragments_factor = as.factor(num_fragments))
+dbrms_time %>%
+  group_by(method) %>%
+  summarize(n = n(), mean = mean(tot_time), median = median(tot_time))
+#+end_src
+
+#+RESULTS[c8555335e9948d4796a64d1892a76af8eb551686]:
+| method  |   n | mean | median |
+|---------+-----+------+--------|
+| Dimer   | 163 | 21.0 |   18.4 |
+| GPDimer | 163 | 16.6 |    7.8 |
+| OTGPD   | 163 | 11.1 |    6.7 |
+
+Now some EDA.
+
+#+begin_src R :eval never
+ggpairs(
+  dbrms_time %>% select(-system_id,-spin,-mol_id,-fragment_sizes,-success,-iter_steps,-dimer_rot,-dimer_trans,-termination_status) %>% mutate(num_fragments=as.factor(num_fragments)),
+  aes(color = method, alpha = 0.5),
+  lower = list(continuous = wrap("points", size = 0.5)),
+  upper = list(continuous = wrap("cor", size = 3))
+)
+#+end_src
+
+#+begin_src R :eval never
+prior_list_time <- c(
+  prior(normal(0, 1), class = "b"),  # Weakly informative prior for fixed effects
+  prior(student_t(3, 0, 2.5), class = "Intercept"), # Prior for intercept
+  prior(exponential(1), class = "sd"),  # Prior for random effect SD
+  prior(exponential(1), class = "shape") # Prior for the gamma shape parameter
+)
+brms_ttime <- load_brms_model(
+  file_path = "data/models/brms_ttime.rds",
+  formula = bf(tot_time ~ method + (1 | mol_id:spin)),
+  data = dfff %>% filter(success==TRUE),
+  family = Gamma(link = "log"),
+  prior = prior_list_time,
+  chains = 4,
+  iter = 4000,
+  warmup = 1000,
+  cores = 4,
+  seed = 1995,
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  backend = "cmdstanr"
+)
+#+end_src
+
+#+RESULTS[0c8b13a3c84d00b697c557764b7c519509f8d3e0]:
+
+#+begin_src R
+# Define the priors, including the essential one for the spline (sds)
+prior_spline <- c(
+  prior(normal(0, 1), class = "sds"), # Controls spline "wiggliness"
+  prior(normal(0, 1), class = "b"),
+  prior(student_t(3, 0, 2.5), class = "Intercept"),
+  prior(exponential(1), class = "sd"),
+  prior(exponential(1), class = "shape")
+)
+
+# Fit the spline model
+# This will take longer than the polynomial model, but it's doing more work.
+brms_ttime_spline <- load_brms_model(
+  file_path = "data/models/brms_ttime_spline.rds",
+  formula = bf(tot_time ~ method + s(log_pes_calls, by = method, k = 5) + (1 | mol_id:spin)),
+  data = dfff %>% filter(success==TRUE) %>% mutate(log_pes_calls=log(pes_calls)),
+  family = Gamma(link = "log"),
+  prior = prior_spline,
+  chains = 4,
+  iter = 4000,
+  warmup = 1000,
+  cores = 4,
+  seed = 1995,
+  backend = "cmdstanr",
+  control = list(adapt_delta = 0.99, max_treedepth = 15)
+)
+#+end_src
+
+#+begin_src R
+otgpd_max_log <- log(136)
+gpd_max_log <- log(172)
+
+
+# --- Step 2: Extract prediction data (THE EFFICIENT WAY) ---
+# We run conditional_effects WITHOUT spaghetti = TRUE
+prediction_list <- conditional_effects(brms_ttime_spline, effects = "log_pes_calls:method")
+
+# The resulting object is a list, and the first element is our data frame
+plot_data <- prediction_list$`log_pes_calls:method`
+
+
+# --- Step 3: Define extrapolation zones (same as before) ---
+plot_data <- plot_data %>%
+  mutate(
+    line_type = case_when(
+      method == "Dimer" ~ "Solid",
+      method == "GPDimer" & log_pes_calls <= gpd_max_log ~ "Solid",
+      method == "GPDimer" & log_pes_calls > gpd_max_log ~ "Dotted",
+      method == "OTGPD" & log_pes_calls <= otgpd_max_log ~ "Solid",
+      method == "OTGPD" & log_pes_calls > otgpd_max_log ~ "Dotted",
+      TRUE ~ "Solid"
+    )
+  )
+
+# --- Step 4: Calculate binned medians of raw data (same as before) ---
+median_data <- dbrms_time %>%
+  mutate(log_pes_bin = cut(log_pes_calls, breaks = 200)) %>%
+  group_by(method, log_pes_bin) %>%
+  summarise(
+    median_tot_time = median(tot_time),
+    log_pes_calls = median(log_pes_calls)
+  ) %>%
+  ungroup()
+
+mean_data <- dbrms_time %>%
+  mutate(log_pes_bin = cut(log_pes_calls, breaks = 200)) %>%
+  group_by(method, log_pes_bin) %>%
+  summarise(
+    # Use mean() instead of median()
+    mean_tot_time = mean(tot_time),
+    log_pes_calls = median(log_pes_calls)
+  ) %>%
+  ungroup()
+
+# --- Step 5: Build the final plot (same as before) ---
+ggplot(plot_data, aes(x = log_pes_calls, y = estimate__, color = method, fill = method)) +
+  geom_ribbon(aes(ymin = lower__, ymax = upper__), alpha = 0.2, color = NA) +
+  geom_line(aes(linetype = line_type), size = 1) +
+  geom_point(data = mean_data, aes(y = mean_tot_time), size = 2, alpha = 0.8) +
+  scale_linetype_manual(values = c("Solid" = 1, "Dotted" = 3), name = "Prediction Type") +
+  coord_cartesian(xlim = c(min(dbrms_time$log_pes_calls), gpd_max_log + 0.5), ylim = c(0, 100)) +
+  labs(
+    title = "Model Predictions vs. Binned Means",
+    subtitle = "Dotted lines indicate extrapolation beyond the method's observed maximum",
+    x = "log(PES Calls)",
+    y = "Total Time"
+  ) +
+  theme_minimal() +
+  guides(linetype = "none")
+#+end_src
+
+#+RESULTS[86fcf3a3e4395b724fa9d35ae9c4c1208840858d]:
+
+#+begin_src R :results output
+summary(brms_ttime_spline)
+#+end_src
+
+#+RESULTS[82b8927f1e078c702c36644cebc593a5a9a014a1]:
+#+begin_example
+ Family: gamma
+  Links: mu = log
+Formula: tot_time ~ method + s(log_pes_calls, by = method, k = 5) + (1 | mol_id:spin)
+   Data: data (Number of observations: 1433)
+  Draws: 4 chains, each with iter = 4000; warmup = 1000; thin = 1;
+         total post-warmup draws = 12000
+
+Smoothing Spline Hyperparameters:
+                                   Estimate
+sds(slog_pes_callsmethodDimer_1)       2.44
+sds(slog_pes_callsmethodGPDimer_1)     3.79
+sds(slog_pes_callsmethodOTGPD_1)       4.15
+                                   Est.Error
+sds(slog_pes_callsmethodDimer_1)        0.51
+sds(slog_pes_callsmethodGPDimer_1)      0.52
+sds(slog_pes_callsmethodOTGPD_1)        0.51
+                                   l-95% CI
+sds(slog_pes_callsmethodDimer_1)       1.56
+sds(slog_pes_callsmethodGPDimer_1)     2.87
+sds(slog_pes_callsmethodOTGPD_1)       3.22
+                                   u-95% CI Rhat
+sds(slog_pes_callsmethodDimer_1)       3.53 1.00
+sds(slog_pes_callsmethodGPDimer_1)     4.89 1.00
+sds(slog_pes_callsmethodOTGPD_1)       5.24 1.00
+                                   Bulk_ESS
+sds(slog_pes_callsmethodDimer_1)       8533
+sds(slog_pes_callsmethodGPDimer_1)    10689
+sds(slog_pes_callsmethodOTGPD_1)      12370
+                                   Tail_ESS
+sds(slog_pes_callsmethodDimer_1)       6729
+sds(slog_pes_callsmethodGPDimer_1)     7913
+sds(slog_pes_callsmethodOTGPD_1)       8356
+
+Multilevel Hyperparameters:
+~mol_id:spin (Number of levels: 499)
+              Estimate Est.Error l-95% CI u-95% CI
+sd(Intercept)     0.39      0.02     0.35     0.42
+              Rhat Bulk_ESS Tail_ESS
+sd(Intercept) 1.00     3036     6241
+
+Regression Coefficients:
+                               Estimate Est.Error
+Intercept                          2.71      0.12
+methodGPDimer                      1.15      0.22
+methodOTGPD                       -0.11      0.28
+slog_pes_calls:methodDimer_1       1.51      0.95
+slog_pes_calls:methodGPDimer_1     0.44      1.00
+slog_pes_calls:methodOTGPD_1       0.22      1.00
+                               l-95% CI u-95% CI
+Intercept                          2.48     2.94
+methodGPDimer                      0.72     1.58
+methodOTGPD                       -0.67     0.44
+slog_pes_calls:methodDimer_1      -0.33     3.38
+slog_pes_calls:methodGPDimer_1    -1.54     2.40
+slog_pes_calls:methodOTGPD_1      -1.74     2.16
+                               Rhat Bulk_ESS
+Intercept                      1.00    10213
+methodGPDimer                  1.00     7315
+methodOTGPD                    1.00     7428
+slog_pes_calls:methodDimer_1   1.00    13657
+slog_pes_calls:methodGPDimer_1 1.00    19482
+slog_pes_calls:methodOTGPD_1   1.00    19934
+                               Tail_ESS
+Intercept                          9335
+methodGPDimer                      8663
+methodOTGPD                        7717
+slog_pes_calls:methodDimer_1       9152
+slog_pes_calls:methodGPDimer_1     8434
+slog_pes_calls:methodOTGPD_1       9243
+
+Further Distributional Parameters:
+      Estimate Est.Error l-95% CI u-95% CI Rhat
+shape     7.73      0.36     7.04     8.47 1.00
+      Bulk_ESS Tail_ESS
+shape     6529     8211
+
+Draws were sampled using sample(hmc). For each parameter, Bulk_ESS
+and Tail_ESS are effective sample size measures, and Rhat is the potential
+scale reduction factor on split chains (at convergence, Rhat = 1).
+#+end_example
+
+
+Which we summarised by:
+
+#+begin_src R :results value :colnames yes :post round-tbl[:colnames yes](*this*)
+# --- Step 1: Define the scenarios for comparison ---
+# We'll compare the expected total time for each method at 30 PES calls.
+comparison_df <- tibble(
+  pes_calls = 30,
+  log_pes_calls = log(pes_calls),
+  method = c("Dimer", "GPDimer", "OTGPD"),
+  # A placeholder is needed for the group, but we'll ignore it
+  # to get the population-level prediction.
+  `mol_id:spin` = "s_001singlets"
+)
+
+# --- Step 2: Get posterior predictions and summarize ---
+# `add_epred_draws` gets the expected predictions for our scenarios.
+# `re_formula = NA` tells brms to ignore random effects.
+time_predictions <- brms_ttime_spline %>%
+  add_epred_draws(newdata = comparison_df, re_formula = NA) %>%
+  # Summarize the posterior draws for each method
+  group_by(method) %>%
+  summarise(
+    median_time = median(.epred),
+    lower_95 = quantile(.epred, 0.025),
+    upper_95 = quantile(.epred, 0.975)
+  )
+
+# --- Step 3: Calculate percentage differences relative to the Dimer method ---
+# We need the Dimer's median time as a baseline for comparison
+baseline_time <- time_predictions %>%
+  filter(method == "Dimer") %>%
+  pull(median_time)
+
+# Calculate percentage change for the other methods
+percentage_summary <- time_predictions %>%
+  filter(method != "Dimer") %>%
+  mutate(
+    perc_change = (median_time - baseline_time) / baseline_time * 100
+  )
+
+# --- Step 4: Format and combine for the final table ---
+# Format the main time predictions
+formatted_times <- time_predictions %>%
+  mutate(
+    Effect_Type = paste0("Expected Time (min) @ 30 PES Calls (", method, ")"),
+    `Median Effect` = sprintf("%.1f", median_time),
+    `95% CrI` = paste0("[", sprintf("%.1f", lower_95), ", ", sprintf("%.1f", upper_95), "]")
+  ) %>%
+  select(Effect_Type, `Median Effect`, `95% CrI`)
+
+# Format the percentage change predictions
+formatted_percentages <- percentage_summary %>%
+  mutate(
+    Effect_Type = paste0("Percentage Change vs Dimer @ 30 PES Calls (", method, ")"),
+    `Median Effect` = sprintf("%.1f%%", perc_change),
+    `95% CrI` = "N/A" # Credible intervals for ratios are more complex; median is robust
+  ) %>%
+  select(Effect_Type, `Median Effect`, `95% CrI`)
+
+# Combine into the final table
+final_summary_spline <- bind_rows(
+  formatted_times,
+  formatted_percentages
+) %>%
+  arrange(Effect_Type)
+
+# Print the final table
+print(final_summary_spline)
+#+end_src
+
+#+RESULTS[a95bd35dbf65438614f5d3c2b4e6e8930a8bd66b]:
+| Effect_Type                                         | Median Effect | 95% CrI      |
+|-----------------------------------------------------+---------------+--------------|
+| Expected Time (min) @ 30 PES Calls (Dimer)          |          11.5 | [8.1, 16.4]  |
+| Expected Time (min) @ 30 PES Calls (GPDimer)        |          12.8 | [12.2, 13.5] |
+| Expected Time (min) @ 30 PES Calls (OTGPD)          |          11.3 | [10.8, 11.9] |
+| Percentage Change vs Dimer @ 30 PES Calls (GPDimer) |         12.0% | N/A          |
+| Percentage Change vs Dimer @ 30 PES Calls (OTGPD)   |         -1.2% | N/A          |
+
+
+Or much more reasonably, using the median of the calls per method:
+
+#+begin_src R :results value :colnames yes :post round-tbl[:colnames yes](*this*)
+convergence_scenarios <- tibble(
+  method = c("Dimer", "GPDimer", "OTGPD"),
+  pes_calls = c(254, 30, 28) # Using the medians from your benchmark
+) %>%
+  mutate(log_pes_calls = log(pes_calls))
+
+# --- Step 2: Get posterior predictions for these realistic scenarios ---
+time_at_convergence <- brms_ttime_spline %>%
+  add_epred_draws(newdata = convergence_scenarios, re_formula = NA) %>%
+  # Summarize the posterior draws for each method's typical run
+  group_by(method, pes_calls) %>%
+  summarise(
+    median_time = median(.epred),
+    lower_95 = quantile(.epred, 0.025),
+    upper_95 = quantile(.epred, 0.975),
+    .groups = "drop"
+  )
+
+# --- Step 3: Format the final table ---
+final_summary_realistic <- time_at_convergence %>%
+  mutate(
+    `Median PES Calls` = pes_calls,
+    `Expected Time-to-Solution (min)` = sprintf("%.1f", median_time),
+    `95% CrI` = paste0("[", sprintf("%.1f", lower_95), ", ", sprintf("%.1f", upper_95), "]")
+  ) %>%
+  select(Method = method, `Median PES Calls`, `Expected Time-to-Solution (min)`, `95% CrI`) %>%
+  arrange(desc(`Expected Time-to-Solution (min)`))
+
+# Print the final, more meaningful table
+print(final_summary_realistic)
+#+end_src
+
+#+RESULTS[48de7ba5ba3d59b37630ee3d5057b4aa48ab5614]:
+| Method  | Median PES Calls | Expected Time-to-Solution (min) | 95% CrI      |
+|---------+------------------+---------------------------------+--------------|
+| OTGPD   |               28 |                             9.0 | [8.6, 9.5]   |
+| Dimer   |              254 |                            20.5 | [19.2, 21.8] |
+| GPDimer |               30 |                            12.8 | [12.2, 13.5] |
+
+**** Plots
+We need an extrapolation plot.
+#+begin_src R
+# --- Extract Posterior Predictions from the Model ---
+prediction_list <- conditional_effects(brms_ttime_spline, effects = "log_pes_calls:method")
+plot_data <- prediction_list$`log_pes_calls:method`
+
+# --- Define Extrapolation Zones ---
+# Identify the maximum number of PES calls observed in the data for the two GP-based methods.
+# Any prediction beyond this point is an extrapolation.
+otgpd_max_log <- log(max(dbrms_time$pes_calls[dbrms_time$method == "OTGPD"]))
+gpd_max_log <- log(max(dbrms_time$pes_calls[dbrms_time$method == "GPDimer"]))
+
+# Add a column to flag whether a prediction is an interpolation or extrapolation.
+plot_data <- plot_data %>%
+  mutate(
+    prediction_type = case_when(
+      method == "Dimer"   ~ "Interpolation",
+      method == "GPDimer" & log_pes_calls <= gpd_max_log ~ "Interpolation",
+      method == "GPDimer" & log_pes_calls > gpd_max_log  ~ "Extrapolation",
+      method == "OTGPD"   & log_pes_calls <= otgpd_max_log ~ "Interpolation",
+      method == "OTGPD"   & log_pes_calls > otgpd_max_log  ~ "Extrapolation",
+      TRUE ~ "Interpolation" # Default case
+    )
+  )
+
+# --- Generate the Plot ---
+publication_plot <- ggplot(mapping = aes(x = log_pes_calls, color = method, fill = method)) +
+  # Layer 1: Raw data points. Jittered slightly for visibility.
+  geom_jitter(
+    data = dbrms_time, aes(y = tot_time),
+    width = 0.05, height = 0, size = 1.5, alpha = 0.15, shape = 16
+  ) +
+
+  # Layer 2: 95% Credible intervals from the model.
+  geom_ribbon(
+    data = plot_data, aes(y = estimate__, ymin = lower__, ymax = upper__),
+    alpha = 0.25, color = NA
+  ) +
+
+  # Layer 3: The mean posterior prediction line. Linetype changes for extrapolation.
+  geom_line(data = plot_data, aes(y = estimate__, linetype = prediction_type), size = 1.1) +
+
+  # Layer 4: Vertical lines to clearly mark the end of observed data for GP methods.
+  # Colors are now matched to the Okabe-Ito palette assuming ggplot's default factor ordering.
+  # Dimer="#E69F00", GPDimer="#56B4E9", OTGPD="#009E73"
+  geom_vline(xintercept = gpd_max_log, linetype = "dashed", color = "#56B4E9", alpha = 0.8) +
+  geom_vline(xintercept = otgpd_max_log, linetype = "dashed", color = "#009E73", alpha = 0.8) +
+
+  # Layer 5: Text annotations for the vertical lines.
+  annotate("text", x = gpd_max_log, y = 95, label = "GPDimer max obs.", angle = 90, vjust = -0.5, hjust = 1, size = 3.5, color = "#56B4E9") +
+  annotate("text", x = otgpd_max_log, y = 95, label = "OTGPD max obs.", angle = 90, vjust = 1.5, hjust = 1, size = 3.5, color = "#009E73") +
+
+  # --- 4. Scales, Labels, and Theming ---
+  scale_color_Publication(name = "Method:") +
+  scale_fill_Publication(name = "Method:") +
+  scale_linetype_manual(values = c("Interpolation" = "solid", "Extrapolation" = "dashed"), name = "Prediction:") +
+  coord_cartesian(
+    xlim = c(min(dbrms_time$log_pes_calls), max(dbrms_time$log_pes_calls[dbrms_time$method != "Dimer"]) + 0.5),
+    ylim = c(0, 100)
+  ) +
+  labs(
+    title = "Modelled Time-to-Solution as a Function of Computational Effort",
+    subtitle = "Posterior predictions from a Gamma spline model with 95% credible intervals.",
+    x = expression(log("PES Calls")),
+    y = "Total Time (min)",
+    caption = "Points show raw data. Shaded regions are 95% CrI. Dashed lines indicate extrapolation."
+  ) +
+  theme_Publication(base_size = 14)
+
+# --- 5. Display the Plot ---
+ggsave("timing_model_plot_pub_theme.png", plot = publication_plot, width = 11, height = 7, dpi = 300)
+## print(publication_plot)
+#+end_src
+
+The box plot indicates that there is no systematic bias, so it is good enough for relative comparisons.
