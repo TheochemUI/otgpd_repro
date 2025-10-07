@@ -1,0 +1,12 @@
+; DO NOT EDIT (unless you know what you are doing)
+;
+; This subdirectory is a git "subrepo", and this file is maintained by the
+; git-subrepo command. See https://github.com/ingydotnet/git-subrepo#readme
+;
+[subrepo]
+	remote = git@github.com:HaoZeke/chemparseplot
+	branch = gprdemd
+	commit = 6c14e5aa0b7a7b20b0f4026575ade1212ffbe2ac
+	parent = 7efa0c11c0b15f09c4a9ccfa89f5abea76f26cbb
+	method = merge
+	cmdver = 0.4.9
