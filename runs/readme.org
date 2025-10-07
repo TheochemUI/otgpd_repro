@@ -1,0 +1,13 @@
+* About
+To generate ~csv~ data:
+#+begin_src bash
+pixi r -e analysis mkira
+pixi s -e analysis
+# single fragment data
+python calc_rundata.py --run_dir automated/snake_runs/softmode_wbo_1ang_scg/ --output rundata/data_otgp_wbo1ang.csv --method "OTGP"
+# complete run
+python calc_rundata.py --run_dir automated/snake_runs/softest_mode_scg_barrier/ --output rundata/data_otgp.csv --method "OTGP"
+# jctc data
+python calc_rundata.py --run_dir ../../gprd_sella_bench/bench_runs/eon/runs/1e8m/idimer/final_cgrot_lbfgs_dimer/ --output rundata/jctc/data_idimer_cgrot_lbfgs.csv --method "IDimer"
+python calc_rundata.py --run_dir ../../gprd_sella_bench/bench_runs/eon/runs/1e8m/gprd/final_gprd_wparam/ --output data_gprd.csv --method "GPRD"
+#+end_src

@@ -41,8 +41,6 @@ The repository has code archives, benchmark runs, and scripts for analysis.
 ├── config
 │   └── vocabularies
 ├── data
-│   ├── models
-│   └── sella_si_data.zip
 ├── docs
 │   ├── 00_freeform.org
 │   ├── 01_hpc.org
