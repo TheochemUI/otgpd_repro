@@ -1,0 +1,105 @@
+% An example of the input file
+
+i_dist = 1 
+i_run = 1
+
+dist_sp = [0.02, 0.3, 1.0, 3.0]
+
+% Only active frozen atoms are taken into account in the covariance function.
+% A frozen atom is activated, when it is within the radius of 'actdist_fro'
+% from some moving atom in some configuration on the path.
+% Once a frozen atom is activated, it stays active from then on.
+% If 'actdist_fro' is set to infinity, all frozen atoms are taken into account.
+% When a frozen atom is activated, its coordinates and atomtype index are added
+% to 'conf_info.conf_fro' and 'conf_info.atomtype_fro', respectively,
+% and removed from 'conf_info_inactive.conf_fro' and 'conf_info_inactive.atomtype_fro'.
+% If the new frozen atom activates new pairtypes, also 'conf_info.pairtype'
+% and 'conf_info.n_pt' are updated.
+actdist_fro = 5
+
+dimer_sep = 0.01 % define the dimer separation (distance from the middle point of the dimer to the two images)
+method_rot = @rot_iter_lbfgs % use the conjugate gradient method for rotations
+method_trans = @trans_iter_lbfgs % use the conjugate gradient method for translations
+param_trans = [0.1, 0.1] % define a step length for convex regions and maximum step length
+
+% 'eval_image1' indicates if image 1 of the dimer is evaluted (1) or not (0)
+% after each relaxation phase in addition to the middle point of the dimer
+eval_image1 = 0
+
+% 'T_dimer' defines the final convergence threshold for 'maxF_R', which is
+% the maximum component of the force acting on the middle point of the dimer (i.e., the
+% algorithm is stopped when all components of the accurate force are below 'T_dimer').
+T_dimer = 0.01
+
+% 'initrot_nogp' indicates if the initial rotations are performed without GP (1) or with GP (0).
+initrot_nogp = 0
+
+% 'T_anglerot_init' defines a convergence threshold for the rotation angle
+% in the initial rotations performed in the beginning of the algorithm
+% (the dimer is not rotated when the estimated rotation angle is less than this).
+T_anglerot_init = 0.0873
+
+% 'num_iter_initrot' defines the maximum number of initial rotations (0 if initial rotations skipped).
+num_iter_initrot = 0
+
+% 'inittrans_nogp' is an indicator if an initial test translation step is taken without GP (1)
+% or if GP is used right after initial rotations (0).
+inittrans_nogp = 0
+
+% 'T_anglerot_gp' defines a convergence threshold for the rotation angle
+% during a relaxation phase (the dimer is not rotated when the estimated
+% rotation angle is less than this).
+T_anglerot_gp = 0.01
+
+% 'num_iter_rot_gp' defines a maximum number of rotation iterations per
+% translation during a relaxation phase.
+num_iter_rot_gp = 10
+
+% If 'divisor_T_dimer_gp' is set to zero, the default convergence threshold
+% for each relaxation phase for the approximated 'maxF_R' on the
+% approximated energy surface is 1/10 of the 'T_dimer'. To save inner
+% iterations during the first relaxation phases, one can set a positive
+% value for 'divisor_T_dimer_gp', so that the GP convergence threshold will
+% be 1/'divisor_T_dimer_gp' of the smallest accurate 'maxF_R' obtained so
+% far, but not less than 1/10 of the 'T_dimer'. If the approximation error
+% is assumed to not decrease more than that during one outer iteration,
+% there is no need for more accurate relaxation on an approximated surface.
+divisor_T_dimer_gp = 10
+
+% 'disp_max' defines the maximum displacement of the middle point of the
+% dimer from the nearest observed data point. Thus, the last inner step is
+% rejected and the relaxation phase stopped, if the distance to the nearest
+% observed data point is larger than 'disp_max'.
+disp_max = 0.5
+
+% 'ratio_at_limit' defines the limit for the ratio (< 1) of inter-atomic
+% distances between image and its "nearest" observed data point.
+% More precisely, the last inner step is rejected and the relaxation phase
+% stopped if the following does not hold:
+% There is an observed data point so that all inter-atomic distances of the
+% current image are more than 'ratio_at_limit' (by default 2/3) but less
+% than 1/'ratio_at_limit' (3/2) times the corresponding inter-atomic
+% distance of the observed data point.
+ratio_at_limit = 0.666666666666667
+
+% 'num_bigiter_initloc' defines the number of outer iterations started from the initial location 'R_init'.
+% After that, each relaxation phase is started from the latest converged dimer.
+% Starting each round from the initial location may improve stability (and decrease outer iterations),
+% but starting from the latest dimer may decrease the number of inner iterations during the relaxation phases.
+%% num_bigiter_initloc = inf
+
+% 'num_bigiter_initparam' defines the number of outer iterations where the hyperparameter
+% optimization is started from values initialized based on the range of current data.
+% After that, the optimization is started from the values of the previous round.
+%% num_bigiter_initparam = inf
+
+num_bigiter = 300 % define the maximum number of outer iterations (new sets of observations)
+num_iter = 1000 % define the maximum number of inner iterations (steps during a relaxation phase)
+
+% 'islarge_num_iter' indicates if 'num_iter' is assumed to be much larger than required
+% for dimer convergence on accurate energy surface. If not (0), the next relaxation phase is
+% continued from the current dimer in case 'num_iter' is reached.
+islarge_num_iter = 1
+
+load_file = none % start normally from beginning
+save_file = none % no saves after each outer iteration

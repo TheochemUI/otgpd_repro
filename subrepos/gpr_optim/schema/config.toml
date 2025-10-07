@@ -1,0 +1,98 @@
+# GPR-Dimer Configuration in TOML format
+
+# --- Run-Specific Setup ---
+# Using full precision from original .dat file
+cellDimensions = [15.3455999999999992, 0.0, 0.0, 0.0, 21.7020000000000017, 0.0, 0.0, 0.0, 100.0]
+
+[runSelector]
+iDist = 0
+iRun = 0
+sepDists = [0.02, 0.3, 1.0, 3.0]
+
+# --- Problem Setup and Dimer Control ---
+[problem]
+actdistFro = 5.0
+dimerSep = 0.01
+methodRot = "lbfgs"
+methodTrans = "lbfgs"
+finalConvergenceForce = 0.01 # Maps to T_dimer
+divisorTdimerGP = 10
+midpointMaxDisp = 0.5 # Maps to disp_max
+ratioAtLimit = 0.666666666666667
+
+[problem.paramTrans]
+stepLength = 0.1
+maxStepLength = 0.1
+rotremThresh = inf
+
+[problem.initialRotations]
+maxIterations = 6       # Maps to num_iter_initrot
+useGpr = true           # Equivalent to initrot_nogp = 0
+convergenceAngle = 0.0873 # Maps to T_anglerot_init
+
+[problem.relaxation]
+maxOuterIterations = 300      # Maps to num_bigiter
+maxInnerIterations = 1000     # Maps to num_iter
+maxRotationIterations = 10    # Maps to num_iter_rot_gp
+assumeManyIterations = true   # Maps to islarge_num_iter = 1
+useGprForInitialTranslation = true # Maps to inittrans_nogp = 0
+
+[problem.relaxation.convergence]
+# This block holds the convergence criteria for the GPR surface
+angle = 0.01    # Maps to T_anglerot_gp
+force = 0.001
+
+# --- GPR Model & Optimization ---
+[gpr]
+gpSigma2 = 1.0e-8
+jitterSigma2 = 0.0
+noiseSigma2 = 1.0e-8 # from p.sigma2
+
+[gpr.prior]
+mu = 0.0
+nu = 20.0
+s2 = 1.0
+
+[optimizer]
+algorithm = "scg"
+checkDerivative = false
+maxIter = 400
+tolFunc = 1.0e-4
+tolSol = 1.0e-4
+
+[optimizer.scg]
+lambdaLimit = 1.0e20
+lambda = 10.0
+
+# Example if Adam is used
+# [optimizer.adam]
+# lr = 0.001
+# lrd = 0.999
+# b1 = 0.9
+# b2 = 0.999
+# eps = 1e-8
+# weightDecay = 0.0
+# amsgrad = false
+
+[early_stopping]
+dist_metric = "emd"
+threshold = 1.2
+
+# --- Ancillary Modules ---
+[pruning]
+usePrune = false
+pruneBegin = 8
+pruneNVals = 3
+pruneThreshold = 0.3
+
+[debug]
+reportLevel = 1
+debugLevel = 0
+debugOutDir = "output"
+debugPosFile = "position"
+debugEnergyFile = "energy"
+debugGradFile = "gradient"
+debugOutExt = "dat"
+debugOffsetMidPoint = 3.0
+debugDy = 0.1
+debugDz = 0.1

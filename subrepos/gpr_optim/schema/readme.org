@@ -1,0 +1,7 @@
+* About
+This contains a set of Cap'n Proto schemas for interacting with the parameters
+of the GPRD library.
+** Usage
+#+begin_src bash
+uv run gen_capnp_params.py config.toml ../input/capnp_params.bin
+#+end_src

@@ -1,0 +1,44 @@
+[project]
+name = "gpr_optim"
+version = "0.1.0"
+description = "Library for working with an atomic GP Dimer"
+authors = ["Rohit Goswami <rog32@hi.is>", "Maxim Masterov", "Satish Kamath"]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tasks]
+
+[dependencies]
+gtest = "1.14.0.*"
+eigen = "3.4.0.*"
+cmake = "3.27.6.*"
+meson = "1.2.3.*"
+pkgconfig = "1.5.5.*"
+highfive = ">=2.10.1,<3"
+hdf5 = ">=1.14.3,<2"
+capnproto = ">=1.2.0,<2"
+
+[environments]
+analysis = {features = ["analysis"]}
+docs = {features = ["docs"]}
+
+[feature.analysis.dependencies]
+ase = ">=3.26.0,<4"
+h5py = ">=3.14.0,<4"
+pycapnp = ">=1.1.0,<2"
+ipython = ">=8.37.0,<9"
+
+[feature.docs.dependencies]
+doxygen = "==1.9.1"
+
+[feature.docs.tasks.mkdoxydoc]
+cmd = """
+./scripts/get_doc_requirements.sh &&
+doxygen apidocs/Doxygen-prj.cfg
+"""
+
+[feature.eon.dependencies]
+pycapnp = "*"
+
+[feature.docs.tasks]
+srv_docs = {cmd = "python -m http.server -d html", depends-on = "mkdoxydoc"}

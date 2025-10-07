@@ -1,0 +1,12 @@
+; DO NOT EDIT (unless you know what you are doing)
+;
+; This subdirectory is a git "subrepo", and this file is maintained by the
+; git-subrepo command. See https://github.com/ingydotnet/git-subrepo#readme
+;
+[subrepo]
+	remote = git@github.com:HaoZeke/gpr_optim
+	branch = distance_to_train
+	commit = 18da34ec893b5ff13dec59256890102659a99e65
+	parent = e1303683500bbf4ebbd74b083a1061dea484a5a7
+	method = merge
+	cmdver = 0.4.9

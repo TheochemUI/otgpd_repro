@@ -1,0 +1,209 @@
+# Default stages that should be passed every time
+stages:
+    - pre_config
+    - config
+    - build
+    - test
+
+# 1) During the config stage we are preparing all necessary TPLs
+# 2) During the build stage we are building the main code
+# 3) During the test stage we are running all varieties of tests
+# 4) During the example stage we are running an example
+
+###############################################
+###############  Config stages  ###############
+###############################################
+# General pre-config stage (common for all other config stages)
+pre_config:
+  image: gcc:7.3
+  stage: pre_config
+  script:
+    # cleanup to prevent potential issues in the future
+    - rm -rf googletest
+    - git submodule init
+    - git submodule update
+  artifacts:
+    paths:
+      - googletest/
+
+# GCC-7.3
+config-gcc-7_3:
+  image: gcc:7.3
+  dependencies:
+    - pre_config
+  stage: config
+  before_script:
+    - apt update && apt -y install make autoconf cmake libeigen3-dev
+    - cd googletest/googletest
+    - patch < ../../cmake_gtest.patch
+    - mkdir -p build_gcc7.3
+    - cd build_gcc7.3
+    - rm -rf *
+  script:
+    - cmake -DCMAKE_CXX_COMPILER="g++" -DCMAKE_CXX_FLAGS="-std=c++11" ../
+    - make
+    - cd ../../../
+  artifacts:
+    paths:
+      - googletest/googletest/build_gcc7.3/
+
+# GCC-9.3
+config-gcc-9_3:
+  image: gcc:9.3
+  dependencies:
+    - pre_config
+  stage: config
+  before_script:
+    # cleanup to prevent potential issues in the future
+    - apt update && apt -y install make autoconf cmake
+    - cd googletest/googletest
+    - patch < ../../cmake_gtest.patch
+    - mkdir -p build_gcc9.3
+    - cd build_gcc9.3
+    - rm -rf *
+  script:
+    - cmake -DCMAKE_CXX_COMPILER="g++" -DCMAKE_CXX_FLAGS="-std=c++11" ../
+    - make
+    - cd ../../../
+  artifacts:
+    paths:
+      - googletest/googletest/build_gcc9.3/
+
+# # clang-7
+# config-clang-7:
+#   image: docker:stable
+#   dependencies:
+#     - pre_config
+#   stage: config
+#   variables: 
+#     DOCKER_HOST: tcp://docker:2376
+#     DOCKER_TLS_CERTDIR: "/certs"
+#     DOCKER_BUILD: 1
+#   services:
+#     - docker:dind
+#   before_script:
+#     # - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+#     - docker info
+#   script:
+#     - echo "===== BUILD DOCKER IMAGE ======="
+#     - echo $DOCKER_USERNAME
+#     - echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+#     - docker build -t clang10 -f Dockerfile misc/
+#     # - docker push $DOCKERHUB_PATH
+
+#   # before_script:
+#   #   # cleanup to prevent potential issues in the future
+#   #   - apt update && apt -y install make autoconf cmake clang-7 libclang-dev libc++-dev libc++abi-dev
+#   #   - cd googletest/googletest
+#   #   - patch < ../../cmake_gtest.patch
+#   #   - mkdir -p build_clang7
+#   #   - cd build_clang7
+#   #   - rm -rf *
+#   # script:
+#   #   - cmake -DCMAKE_CXX_COMPILER="clang++-7" -DCMAKE_CXX_FLAGS="-std=c++11 -stdlib=libc++" ../
+#   #   - make
+#   #   - cd ../../../
+#   artifacts:
+#     paths:
+#       - googletest/googletest/build_clang10/
+
+
+###############################################
+###############  Build stages  ################
+###############################################
+# GCC-7.3
+build-gcc-7_3:
+  image: gcc:7.3
+  dependencies:
+    - config-gcc-7_3
+  stage: build
+  script:
+    - apt update && apt -y install libeigen3-dev
+    - export CPATH="/usr/include/eigen3:$CPATH"
+    - g++ --version
+    - make clean OBJDIR=objdir_gcc7.3 EXE_NAME=gpr_gcc7.3.out
+    - make OBJDIR=objdir_gcc7.3 EXE_NAME=gpr_gcc7.3.out LIBS_PATHS=-L./googletest/googletest/build_gcc7.3/lib
+    - cd gpr/eam_potential_fortran
+    - make clean
+    - make
+    - cp mEAMCUH2 ../../
+    - cd ../../
+  artifacts:
+    paths:
+      - gpr_gcc7.3.out
+      - mEAMCUH2
+
+# GCC-9.3
+build-gcc-9_3:
+  image: gcc:9.3
+  dependencies:
+    - config-gcc-9_3
+  stage: build
+  script:
+    - apt update && apt -y install libeigen3-dev
+    - export CPATH="/usr/include/eigen3:$CPATH"
+    - g++ --version
+    - make clean OBJDIR=objdir_gcc9.3 EXE_NAME=gpr_gcc9.3.out
+    - make OBJDIR=objdir_gcc9.3 EXE_NAME=gpr_gcc9.3.out LIBS_PATHS=-L./googletest/googletest/build_gcc9.3/lib
+    - cd gpr/eam_potential_fortran
+    - make clean
+    - make
+    - cp mEAMCUH2 ../../
+    - cd ../../
+  artifacts:
+    paths:
+      - gpr_gcc9.3.out
+      - mEAMCUH2
+
+# # clang-7
+# build-clang-7:
+#   image: gcc:9.3
+#   dependencies:
+#     - config-clang-7
+#   stage: build
+#   before_script:
+#     - apt update && apt -y install make autoconf cmake clang-7 libclang-dev libc++-dev libc++abi-dev
+#   script:
+#     - ls /usr/bin
+#     - clang++-7 --version
+#     - make clean OBJDIR=objdir_clang7 EXE_NAME=gpr_clang7.out
+#     - make CXX=clang++-7 OBJDIR=objdir_clang7 EXE_NAME=gpr_clang7.out LIBS_PATHS=-L./googletest/googletest/build_clang7/lib
+#   artifacts:
+#     paths:
+#       - gpr_clang7.out
+
+
+###############################################
+################  Test stages  ################
+###############################################
+# GCC-7.3
+unit-test-gcc-7_3:
+  image: gcc:7.3
+  dependencies:
+    - build-gcc-7_3
+  stage: test
+  script:
+    - ./gpr_gcc7.3.out
+
+# GCC-9.3
+unit-test-gcc-9_3:
+  image: gcc:9.3
+  dependencies:
+    - build-gcc-9_3
+  stage: test
+  script:
+    - ./gpr_gcc9.3.out
+
+# # clang-7
+# unit-test-clang-7:
+#   image: gcc:9.3
+#   dependencies:
+#     - build-clang-7
+#   stage: test
+#   script:
+#     - ./gpr_clang7.out
+
+
+###############################################
+################  ...........  ################
+###############################################

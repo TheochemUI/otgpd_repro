@@ -1,0 +1,6 @@
+option('use_mkl', type: 'boolean', value: false, description: 'Enable Intel MKL support')
+option('use_hdf5', type: 'boolean', value: true, description: 'Use HDF5 for logs')
+option('use_capnp', type: 'boolean', value: false, description: 'Use CapnProto for parameters')
+option('use_highs', type: 'boolean', value: false, description: 'Use HiGHs for EMD cost matrices')
+option('do_install', type: 'boolean', value: true, description: 'Installs the built library')
+option('with_tests', type: 'boolean', value: false, description: 'Builds testsuite')
