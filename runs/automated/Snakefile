@@ -1,0 +1,111 @@
+import os
+import polars as pl
+
+
+localrules:
+    prepare_files,
+
+
+envvars:
+    "NWCHEM_COMMAND",
+    "IS_HPC",
+    "NWCHEM_MPI",
+    "EON_DISPLACEMENT_DIR",
+# TODO(rg): ^----------- for now to disable this it can be set to /tmp or something
+
+
+# For fresh runs
+SINGLET_IDS = [f"{x:003d}" for x in range(265)]  # 265
+DOUBLET_IDS = [f"{x:003d}" for x in range(235)]  # 235
+# # Generate and remove fragments which are separated in terms of the geometric centers by 2 Angstrom
+# # python -m rgpycrumbs.geom.fragments batch --method bond-order . --min-dist 2 --charge 0 --multiplicity 1 --threshold 0.9
+# # python -m rgpycrumbs.geom.fragments batch --method bond-order . --min-dist 2 --charge 0 --multiplicity 2 --threshold 0.9
+
+# # SINGLET_IDS = ["000"]
+# # DOUBLET_IDS = ["000"]
+# # Read RUN_NAME from env, default to 'default_run' if not set
+RUN_DIR = [os.environ.get("RUN_NAME", "default_run")]
+
+# # TODO(rg): technically this could easily be computed on the fly with parameters
+# singlets_df = pl.read_csv("singlet_wbo_1ang.csv")
+# doublets_df = pl.read_csv("doublet_wbo_1ang.csv")
+
+# # Filter for molecules with exactly one fragment
+# SINGLET_IDS = [x.split('.')[0] for x in singlets_df.filter(pl.col("num_fragments") == 1)['filename']]
+# DOUBLET_IDS = [x.split('.')[0] for x in doublets_df.filter(pl.col("num_fragments") == 1)['filename']]
+
+# These are timing out with ceres_opt_l8_magn20 and 1 fragment
+# SINGLET_IDS = [f"{x:003d}" for x in [46, 60, 63, 109, 120, 163, 185, 236, 244, 255, 256]]
+# DOUBLET_IDS = [f"{x:003d}" for x in [65, 75, 122, 145, 172, 208]]
+# Timeout with "tightopt"
+# SINGLET_IDS = [f"{x:003d}" for x in [46, 60, 63, 109, 120, 163, 236, 255, 256]]
+# DOUBLET_IDS = [f"{x:003d}" for x in [65, 122, 172]]
+
+rule all:
+    """Run all calculations for different indices and spin states."""
+    input:
+        expand(
+            "snake_runs/{rundir}/{spin}/{index}/results.dat",
+            index=SINGLET_IDS,
+            spin="singlet",
+            rundir=RUN_DIR,
+        ),
+        expand(
+            "snake_runs/{rundir}/{spin}/{index}/results.dat",
+            index=DOUBLET_IDS,
+            spin="doublet",
+            rundir=RUN_DIR,
+        ),
+
+
+rule prepare_files:
+    """
+    Run the main Python script to generate initial eOn inputs,
+    including config.ini and the spin-specific NWChem settings.
+    """
+    output:
+        config="snake_runs/{rundir}/{spin}/{index}/config.ini",
+        direction="snake_runs/{rundir}/{spin}/{index}/direction.dat",
+        displacement="snake_runs/{rundir}/{spin}/{index}/displacement.con",
+        pos="snake_runs/{rundir}/{spin}/{index}/pos.con",
+        # Explicitly list the spin-specific settings file as an output
+        nwchem_settings="snake_runs/{rundir}/{spin}/{index}/nwchem_{spin}.nwi",
+        nwchem_socket="snake_runs/{rundir}/{spin}/{index}/nwchem_socket.nwi",
+    shell:
+        """
+        pixi run python run_eon.py {wildcards.index} \
+            --spin {wildcards.spin} \
+            --rdir {wildcards.rundir}
+        """
+
+
+rule run_eon:
+    """
+    Run a blessed EON
+    """
+    input:
+        config=rules.prepare_files.output.config,
+        direction=rules.prepare_files.output.direction,
+        displacement=rules.prepare_files.output.displacement,
+        pos=rules.prepare_files.output.pos,
+        nwchem_socket_input=rules.prepare_files.output.nwchem_socket,
+    output:
+        "snake_runs/{rundir}/{spin}/{index}/results.dat",
+        "snake_runs/{rundir}/{spin}/{index}/gpr_optim_out.h5",
+    threads: int(os.environ["NWCHEM_MPI"])
+    resources:
+        nodes=1,
+        ntasks_per_node=int(os.environ["NWCHEM_MPI"]),
+        slurm_partition="s-normal",
+        runtime="43200",  # 12 hours
+        mem_mb="3000",
+        slurm_account="chem-ui",
+        slurm_out=lambda wc: f"snake_runs/{wc.rundir}/{wc.spin}/{wc.index}/slurm-%j.out",
+        slurm_err=lambda wc: f"snake_runs/{wc.rundir}/{wc.spin}/{wc.index}/slurm-%j.err",
+    shell:
+        """
+        export RUNDIR={wildcards.rundir}
+        export SPIN={wildcards.spin}
+        export INDEX={wildcards.index}
+        ./scripts/run_eon.sh
+        """

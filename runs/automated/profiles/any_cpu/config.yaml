@@ -1,0 +1,16 @@
+# -*- yaml -*-
+keep-going: true
+scheduler: "greedy"
+executor: "slurm"
+default-storage-provider: fs
+shared-fs-usage:
+  - persistence
+  - software-deployment
+  - sources
+  - source-cache
+remote-job-local-storage-prefix: "/scratch/users/rog32/$SLURM_JOB_ID"
+#local-storage-prefix: "/tmp"
+# TODO(rg): document and setup with YTE
+set-resources:
+  all:
+    runtime: "43200" # 12 hours

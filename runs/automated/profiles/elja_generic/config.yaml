@@ -1,0 +1,41 @@
+executor: cluster-generic
+cluster-generic-submit-cmd:
+  mkdir -p logs/{rule} &&
+  sbatch
+    --nodes={resources.nodes}
+    --ntasks-per-node={resources.ntasks_per_node}
+    --partition={resources.partition}
+    --job-name=smk-{rule}-{wildcards}
+    --output={resources.slurm_out}
+    --error={resources.slurm_err}
+    --time={resources.time}
+    # --mail-type=ALL
+    # --mail-user=rog32@hi.is
+cluster-generic-cancel-cmd: scancel
+default-resources:
+  - nodes=1
+  - partition=s-normal
+  - time="0-4:00:00"
+  - ntasks_per_node=16
+  - slurm_out="logs/{rule}/{rule}-{wildcards}-%j.out"
+  - slurm_err="logs/{rule}/{rule}-{wildcards}-%j.err"
+# default-storage-provider: fs
+# shared-fs-usage:
+#     - persistence
+#     - software-deployment
+#     - sources
+#     - source-cache
+# remote-job-local-storage-prefix: "/scratch/users/rog32/gprd_sella_bench/bench_runs/eon/slurm_runs/$SLURM_JOB_ID"
+# local-storage-prefix: "scratch/"
+restart-times: 0
+max-jobs-per-second: 30
+max-status-checks-per-second: 1
+local-cores: 1
+latency-wait: 10
+jobs: 85
+keep-going: True
+keep-incomplete: True
+rerun-incomplete: False
+printshellcmds: True
+scheduler: greedy
+use-conda: False

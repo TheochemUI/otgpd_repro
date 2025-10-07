@@ -1,0 +1,84 @@
+* Overview
+The workflow in the ~Snakefile~ automates the process of setting up and running
+eOn calculations for a set of molecules, varying spin states (singlets and
+doublets). It utilizes Snakemake for workflow management, enabling parallel
+execution and efficient handling of dependencies.
+
+The workflow is designed to be run either on a High-Performance Computing (HPC)
+cluster or a local machine.
+
+* Directory Structure
+The workflow expects the following directory structure:
+
+#+begin_example
+.
+├── snake_runs/                 <- Output directory for calculations
+│   └── {rundir}/
+│       └── {spin}/
+│           └── {index}/
+│               ├── config.ini
+│               ├── direction.dat
+│               ├── displacement.con
+│               ├── pos.con
+│               ├── results.dat
+│               ├── mode.dat
+│               ├── saddle.con
+│               ├── gpr_optim_out.h5
+│               ├── nwchem_{spin_type}.nwi
+│               └── nwchem_socket.nwi
+├── run_eon.py
+├── Snakefile             <- Snakemake workflow definition
+├── base_config.ini       <- Base configuration for eOn
+└── gpr_mixin.ini         <- GPR-specific configuration for eOn
+#+end_example
+
+* Configuration
+** Environment Variables
+The workflow uses the following environment variables:
+
+| Variable Name   | Description                                                                                                                                                                   |
+|-----------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| =NWCHEM_COMMAND= | Path to the NWChem executable.                                                                                                                                               |
+| =IS_HPC=        | Set to "true" (or "1", "yes", "True", "Yes" - case-insensitive) to indicate running on an HPC. Set to "false" (or "0", "no", "False", "No", or empty) for local execution. |
+| =RUN_NAME=      | Name of the run directory, which will be created under =snake_runs/=. Defaults to =gprd_local= if not set.                                        |
+
+* Usage
+** HPC
+1.  Set the =IS_HPC= environment variable to "true":
+#+begin_src shell
+export IS_HPC=true
+#+end_src
+2.  Set the =NWCHEM_COMMAND= environment variable to the path of your NWChem executable.
+3.  Set the =RUN_NAME= environment variable if you want a custom run directory name.
+4.  (Optional) Create and configure a =config.yaml= file.
+5.  Run Snakemake, specifying the number of cores to use:
+#+begin_src shell
+export IS_HPC="true"
+export NWCHEM_COMMAND=$(which nwchem)
+export RUN_NAME="gprd_hpc"
+snakemake --workflow-profile ./profiles/elja_generic/
+#+end_src
+
+** Local
+Note that the number of cores requested for each NWChem calculation might need
+to be scaled down for a local run.
+
+#+begin_src shell
+export IS_HPC="false"
+export NWCHEM_COMMAND=$(which nwchem)
+export RUN_NAME="gprd_local"
+export NWCHEM_MPI=8
+# c3 i.e. run 3 snakemake tasks
+pixi r snakemake -k -c3 --scheduler greedy  --keep-incomplete --rerun-incomplete
+#+end_src
+** Analysis
+For the GP:
+#+begin_src sh
+pixi s -e eon
+python -m rgpycrumbs.eon.gprd.gp_traj gpr_optim_out.h5
+# visualize things
+ase gui outer_only.traj
+# or extract single .con and then..
+# --multiplicity 2 for doublet
+python -m rgpycrumbs.geom.fragments bond-order pos.con --visualize --mutliplicity 2
+#+end_src
