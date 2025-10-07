@@ -1,0 +1,7 @@
+* About
+For bit-for-bit reproducibility rather than rely on distribution and version management, we vendor the primary sources used.
+
+#+begin_quote
+Git subrepo can be a pain, *NEVER* force push or rebase the branchs linked in
+the repo. Regular ~subrepo~ based push and pull work just fine.
+#+end_quote
