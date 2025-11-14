@@ -2059,6 +2059,35 @@ dfff %>%
 | s_207     | OTGPD   | TRUE    |       -7334.0 |         0.0 |
 | s_256     | OTGPD   | TRUE    |       -6330.7 |         0.0 |
 
+**** Only GPDimer/Dimer succeeds
+
+i.e. least coordinated dispalcement (Dimer/GPDimer) compared to the OTGPD with
+the XTB initialization.
+
+#+begin_src R :results value :colnames yes :post round-tbl[:colnames yes](*this*)
+otgpd_failures <- dfff %>%
+  filter(method == "OTGPD", success == FALSE) %>%
+  pull(system_id) %>%
+  unique()
+
+dfff %>%
+  filter(!(system_id %in% gpd_failures) & !(system_id %in% otgpd_successes)) %>%
+  filter(success == TRUE & num_fragments < 3) %>%
+  select(system_id, method, success, saddle_energy, tot_time, pes_calls, rmsd_init_saddle)
+#+end_src
+
+#+RESULTS[110151b807ff533ab58dc2c81310b4b0f2312441]:
+| system_id | method  | success | saddle_energy | tot_time | pes_calls | rmsd_init_saddle |
+|-----------+---------+---------+---------------+----------+-----------+------------------|
+| d_016     | Dimer   | TRUE    |       -5261.6 |      7.4 |       106 |              0.3 |
+| d_084     | Dimer   | TRUE    |       -8376.4 |    255.4 |      2666 |              8.3 |
+| d_100     | Dimer   | TRUE    |      -10371.1 |     24.3 |       214 |              0.2 |
+| s_242     | Dimer   | TRUE    |       -3162.9 |     14.6 |       249 |              1.0 |
+| d_016     | GPDimer | TRUE    |       -5261.6 |      3.7 |        20 |              0.3 |
+| d_084     | GPDimer | TRUE    |       -8376.5 |    417.0 |        75 |              7.3 |
+| d_100     | GPDimer | TRUE    |      -10370.0 |     16.2 |        28 |              0.5 |
+| s_242     | GPDimer | TRUE    |       -3162.9 |      2.3 |        25 |             13.3 |
+
 **** Only OTGPD suceeds
 #+begin_src R :results value :colnames yes :post round-tbl[:colnames yes](*this*)
 # Find system_ids where GPDimer failed
