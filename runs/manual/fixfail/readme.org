@@ -1,0 +1,111 @@
+* About
+
+4 systems converge for the Dimer and GPDimer but not the OTGPD. These are:
+
+** Fixed
+i.e. by starting from the GPDimer initial configurations:
+- ~pos.con~
+- ~displacement.con~
+- ~direction.dat~
+
+Keeping the ~nwchem*~ and ~config.ini~ from the ~softest_mode_scg~ run.
+
+| System | Calls | Time      |
+|--------+-------+-----------|
+| D016   |    20 | 3m 23s    |
+| D084   |    65 | 3h 1m 25s |
+| D100   |    28 | 18m 31s   |
+| S242   |    33 | 1m 50s    |
+
+Run locally via:
+
+#+begin_src bash
+pixi s -e eon
+pixi r mkeon release
+# system nwchem
+mpirun -n 8 $(which nwchem) nwchem_socket.nwi &
+bless -- eonclient
+#+end_src
+
+*** Comparison
+Times reported in minutes --> ~total seconds / 60~.
+**** D016
+
+| Method  | Calls | Time |
+|---------+-------+------|
+| Dimer   |   106 |  7.4 |
+| GPDimer |    20 |  3.7 |
+| OTGPD   |    20 |  3.3 |
+
+**** D084
+
+| Method  | Calls |  Time |
+|---------+-------+-------|
+| Dimer   |  2666 | 255.4 |
+| GPDimer |    75 |   417 |
+| OTGPD   |    65 | 181.4 |
+
+**** D100
+
+| Method  | Calls |  Time |
+|---------+-------+-------|
+| Dimer   |   214 |  24.3 |
+| GPDimer |    28 |  16.2 |
+| OTGPD   |    28 | 18.52 |
+
+**** S242
+
+| Method  | Calls | Time |
+|---------+-------+------|
+| Dimer   |   249 | 14.6 |
+| GPDimer |    25 |  2.3 |
+| OTGPD   |    33 | 1.85 |
+
+*** System details
+**** Local
+#+begin_src bash
+❯ neofetch
+                   -`                    rgoswami@rgx1gen11 
+                  .o+`                   ------------------ 
+                 `ooo/                   OS: Arch Linux x86_64 
+                `+oooo:                  Host: 21HM002GUS ThinkPad X1 Carbon Gen 11 
+               `+oooooo:                 Kernel: 6.17.5-arch1-1 
+               -+oooooo+:                Uptime: 4 hours, 25 mins 
+             `/:-:++oooo+:               Packages: 2312 (pacman), 7 (flatpak) 
+            `/++++/+++++++:              Shell: bash 5.3.3 
+           `/++++++++++++++:             Resolution: 1920x1200 
+          `/+++ooooooooooooo/`           WM: sway 
+         ./ooosssso++osssssso+`          Theme: Adwaita [GTK2], Adwaita-dark [GTK3] 
+        .oossssso-````/ossssss+`         Icons: Adwaita [GTK2], breeze-dark [GTK3] 
+       -osssssso.      :ssssssso.        Terminal: foot 
+      :osssssss/        osssso+++.       CPU: 13th Gen Intel i7-1365U (12) @ 5.200GHz 
+     /ossssssss/        +ssssooo/-       GPU: Intel Raptor Lake-P [Iris Xe Graphics] 
+   `/ossssso+/:-        -:/+osssso+-     Memory: 9402MiB / 31736MiB 
+  `+sso+:-`                 `.-/+oso:
+ `++:.                           `-/+/                           
+ .`                                 `/                           
+#+end_src
+**** HPC
+16 core runs.
+#+begin_src bash
+❯ neofetch
+          __wgliliiligw_,             rog32@compute-17 
+       _williiiiiiliilililw,          ---------------- 
+     _%iiiiiilililiiiiiiiiiii_        OS: Rocky Linux release 8.10 (Green Obsidian) x86_64 
+   .Qliiiililiiiiiiililililiilm.
+  _iiiiiliiiiiililiiiiiiiiiiliil,     Host: Lenovo -[7X21CTOLWW]- 
+ .lililiiilililiiiilililililiiiii,    Kernel: 4.18.0-553.80.1.el8_10.x86_64 
+_liiiiiiliiiiiiiliiiiiF{iiiiiilili,   Uptime: 8 days, 22 hours, 42 mins 
+jliililiiilililiiili@`  ~ililiiiiiL   Packages: 741 (rpm) 
+iiiliiiiliiiiiiili>`      ~liililii   Shell: bash 4.4.20 
+connect 178.197.231.101 port 6000: Interrupted system call
+iiiiiliiliiiiii~             "4lili   Theme: Adwaita [GTK2] 
+4ililiiiiilil~|      -w,       )4lf   Icons: kora-light [GTK2] 
+-liiiiililiF'       _liig,       )'   Terminal: /dev/pts/1 
+ )iiiliii@`       _QIililig,          CPU: Intel Xeon Gold 6248R (96) @ 3.000GHz 
+  )iiii>`       .Qliliiiililw         GPU: Matrox Electronics Systems Ltd. MGA G200e [Pilot] ServerEngines 
+   )<>~       .mliiiiiliiiiiil,       Memory: 6330MiB / 193084MiB 
+            _gllilililiililii~
+           giliiiiiiiiiiiiT`                                  
+          -^~$ililili@~~'                                     
+#+end_src

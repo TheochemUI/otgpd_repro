@@ -1,0 +1,11 @@
+#-*- mode: conf -*-
+
+basis noprint
+  * library 3-21G
+end
+
+scf
+  nopen 0
+  thresh 1e-8
+  maxiter 200
+end
