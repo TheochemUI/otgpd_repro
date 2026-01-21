@@ -7,21 +7,24 @@ Hermes et. al. [3].
 ** Reference
 If you use this repository or its parts please cite the corresponding publication or data source.
 *** Primary Publication
-Submitted to ChemPhysChem.
+Accepted at ChemPhysChem (in production).
+#+begin_quote
+R. Goswami and H. Jónsson, “Adaptive Pruning for Increased Robustness and Reduced Computational Overhead in Gaussian Process Accelerated Saddle Point Searches,” ChemPhysChem, Nov. 2025, doi: 10.1002/cphc.202500730.
+#+end_quote
 *** Preprint
 A more accessible form of the same publication is:
 
-# #+begin_quote
-# R. Goswami, and H. Jónsson, “Adaptive Pruning for Increased Robustness and Reduced Computational Overhead in Gaussian Process Accelerated Saddle Point Searches,” Oct 08, 2025, arXiv: arXiv:2505.13621. doi: 10.48550/arXiv.2505.13621.
-# #+end_quote
+#+begin_quote
+R. Goswami, and H. Jónsson, “Adaptive Pruning for Increased Robustness and Reduced Computational Overhead in Gaussian Process Accelerated Saddle Point Searches,” Oct 08, 2025, arXiv: arXiv:2505.13621. doi: 10.48550/arXiv.2505.13621.
+#+end_quote
 *** Data source
 :PROPERTIES:
 :CUSTOM_ID: mca
 :END:
-Submitted to the Materials Cloud Archive.
-# #+begin_quote
-# Rohit Goswami, Bayesian hierarchical models for quantitative estimates for performance metrics applied to saddle search algorithms, Materials Cloud Archive 2025.X (2025),
-# #+end_quote
+At the Materials Cloud Archive.
+#+begin_quote
+R. Goswami and H. Jónsson, “Adaptive pruning for increased robustness and reduced computational overhead in gaussian process accelerated saddle point searches.” Materials Cloud, p. 405529315, Oct. 09, 2025. doi: 10.24435/MATERIALSCLOUD:RH-TW.
+#+end_quote
 ** Replication data
 Remember to inflate the data using the ~materialscloud~ source (section ref:mca) before using the scripts in the repository. Assuming that the ~.xz~ files have been downloaded to ~data~ relative to the repository root:
 #+begin_src bash
